@@ -1,11 +1,12 @@
 ------------------------------ MODULE sofaster ------------------------------
 EXTENDS Integers, Sequences, TLC
 
-CONSTANTS Zookeeper, SourceSessions, TargetSessions, NULL, PrepareToSample, Sampling, PrepareForTransfer, TransferingOwnership, WaitForPending, MoveDataToTarget, PrepareForMigration, ReceivingData, WaitForCheckpoint, Checkpointing, 2PCCommit, 2PCPrepare, SourceKeys, TargetKeys, KeysToMigrate 
+CONSTANTS Source, Target, Zookeeper, SourceSessions, TargetSessions, NULL, PrepareToSample, Sampling, PrepareForTransfer, TransferingOwnership, WaitForPending, MoveDataToTarget, PrepareForMigration, ReceivingData, WaitForCheckpoint, Checkpointing, 2PCCommit, 2PCPrepare, SourceKeys, TargetKeys, KeysToMigrate 
+
+Ownership(kvset, view) == [kv \in kvset |-> view]
 
 (*--algorithm sofaster
 variables
-    \*Servers = {Source, Target},
     ServerState = [SourceSessions |-> NULL, TargetSessions |-> NULL],
     SViewNumber = [SourceSessions |-> 0],
     TViewNumber = [TargetSessions |-> 0],
@@ -15,13 +16,12 @@ variables
     TransferCompleteRPC = FALSE,
     ACKTransferCompleteRPC = FALSE,
     Start2PC = FALSE,
-    ServerPrepare2PC = FALSE,
+    SourcePrepare2PC = FALSE,
     TargetPrepare2PC = FALSE,
-    ServerACK = FALSE,
+    SourceACK = FALSE,
     TargetACK = FALSE,
-    ServerCommit = FALSE,
+    SourceCommit = FALSE,
     TargetCommit = FALSE;
-    \*MigrationResult = FALSE;
 
 (*define \* invariants
     \* Migration is atomic - source, target and coordinator are in agreement about result of migration
@@ -39,10 +39,10 @@ end define;
 
 \* remove fair to check crashed states?
 fair process SourceProcess \in SourceSessions
-    variable SKVRanges = {SourceKeys, KeysToMigrate}, TransferComplete = FALSE;
+    variable SKVRanges = {SourceKeys, KeysToMigrate}, TransferComplete = FALSE, SKVOwner = Ownership(SKVRanges, 0);
   begin
     InitMigrationSource: 
-        \* Shared latech on mutable records
+        \* Shared latech on mutable records 
         ServerState[self] := PrepareToSample;
     SampleRecords:
         \* Copy hot records to the tail
@@ -53,8 +53,9 @@ fair process SourceProcess \in SourceSessions
         ServerState[self] := PrepareForTransfer;
         SViewNumber[self] := SViewNumber[self] + 1;
         if ~PrepForTransferRPC then
-            PrepForTransferRPC := TRUE; \* inform target about migrating ranges
+            \* inform target about migrating ranges
             MigrationRange := KeysToMigrate;
+            PrepForTransferRPC := TRUE;
         end if;
     TransferOwnership:
         \* TODO: Inform all clients
@@ -75,6 +76,7 @@ fair process SourceProcess \in SourceSessions
         with sessions \in SourceSessions do
             await ServerState[sessions] = MoveDataToTarget
         end with;
+        SKVOwner := Ownership(SKVRanges, SViewNumber[self]); \* Which view are the remaining records in?
         if ~TransferComplete then
             TransferComplete := TRUE;
         end if;
@@ -86,27 +88,29 @@ fair process SourceProcess \in SourceSessions
         await ACKTransferCompleteRPC;
         Start2PC := TRUE;
     WaitForPrepare:
-        await ServerPrepare2PC;
-        ServerACK := TRUE;
+        await SourcePrepare2PC;
+        SourceACK := TRUE;
         ServerState[self] := 2PCPrepare;
     WaitForDecisionSource:
-        await ServerCommit;
+        await SourceCommit;
         ServerState[self] := 2PCCommit; 
 end process;
 
 fair process TargetProcess \in TargetSessions
-    variable TKVRanges = {TargetKeys}, MigratingRanges = NULL;
+    variable TKVRanges = {TargetKeys}, MigratingRanges = NULL, TKVOwner = Ownership(TKVRanges, 0);
   begin
     InitMigrationTarget:
         await PrepForTransferRPC;
         \* TODO: Buffer requests for migrating ranges
         ServerState[self] := PrepareForMigration;
         MigratingRanges := MigrationRange;
+        TViewNumber[self] := TViewNumber[self] + 1;
     TakeOwnership:
         await TakeOwnershipRPC;
         \* Enter received records
         TKVRanges := TKVRanges \union {MigratingRanges};
         ServerState[self] := ReceivingData;
+        TKVOwner := Ownership(TKVRanges, TViewNumber[self]);
         \* TODO: Start executing requests
     \* Checkpointing and 2PC
     StartCheckpointing:
@@ -122,41 +126,42 @@ fair process TargetProcess \in TargetSessions
         ServerState[self] := 2PCCommit;
 end process;
 
-(*process Clients
+\* Model for client with an active session involved in migration
+(*process Clients = ClientSession
     variable CViewNumber;
   begin 
 end process;*)
 
 \* TODO: Model timeouts and crashes
 fair process CoordinatorProcess = Zookeeper
-    variable ServerReply = [Source |-> NULL, Target |-> NULL];
+    variable ServerVote = [Source |-> NULL, Target |-> NULL]; \* {NULL, TRUE, FALSE}
   begin
     Init2PC:
         await Start2PC;
-        ServerPrepare2PC := TRUE;
+        SourcePrepare2PC := TRUE;
         TargetPrepare2PC := TRUE;
     CompletionDecision:
-        await ServerACK /\ TargetACK;
-        ServerCommit := TRUE;
+        await SourceACK /\ TargetACK;
+        SourceCommit := TRUE;
         TargetCommit := TRUE;
-        \*MigrationResult := TRUE;
+        ServerVote[Source] := SourceCommit || ServerVote[Target] := TargetCommit;
 end process; 
 
 end algorithm; *)
 \* BEGIN TRANSLATION
 VARIABLES ServerState, SViewNumber, TViewNumber, MigrationRange, 
           PrepForTransferRPC, TakeOwnershipRPC, TransferCompleteRPC, 
-          ACKTransferCompleteRPC, Start2PC, ServerPrepare2PC, 
-          TargetPrepare2PC, ServerACK, TargetACK, ServerCommit, TargetCommit, 
-          pc, SKVRanges, TransferComplete, TKVRanges, MigratingRanges, 
-          ServerReply
+          ACKTransferCompleteRPC, Start2PC, SourcePrepare2PC, 
+          TargetPrepare2PC, SourceACK, TargetACK, SourceCommit, TargetCommit, 
+          pc, SKVRanges, TransferComplete, SKVOwner, TKVRanges, 
+          MigratingRanges, TKVOwner, ServerVote
 
 vars == << ServerState, SViewNumber, TViewNumber, MigrationRange, 
            PrepForTransferRPC, TakeOwnershipRPC, TransferCompleteRPC, 
-           ACKTransferCompleteRPC, Start2PC, ServerPrepare2PC, 
-           TargetPrepare2PC, ServerACK, TargetACK, ServerCommit, TargetCommit, 
-           pc, SKVRanges, TransferComplete, TKVRanges, MigratingRanges, 
-           ServerReply >>
+           ACKTransferCompleteRPC, Start2PC, SourcePrepare2PC, 
+           TargetPrepare2PC, SourceACK, TargetACK, SourceCommit, TargetCommit, 
+           pc, SKVRanges, TransferComplete, SKVOwner, TKVRanges, 
+           MigratingRanges, TKVOwner, ServerVote >>
 
 ProcSet == (SourceSessions) \cup (TargetSessions) \cup {Zookeeper}
 
@@ -170,20 +175,22 @@ Init == (* Global variables *)
         /\ TransferCompleteRPC = FALSE
         /\ ACKTransferCompleteRPC = FALSE
         /\ Start2PC = FALSE
-        /\ ServerPrepare2PC = FALSE
+        /\ SourcePrepare2PC = FALSE
         /\ TargetPrepare2PC = FALSE
-        /\ ServerACK = FALSE
+        /\ SourceACK = FALSE
         /\ TargetACK = FALSE
-        /\ ServerCommit = FALSE
+        /\ SourceCommit = FALSE
         /\ TargetCommit = FALSE
         (* Process SourceProcess *)
         /\ SKVRanges = [self \in SourceSessions |-> {SourceKeys, KeysToMigrate}]
         /\ TransferComplete = [self \in SourceSessions |-> FALSE]
+        /\ SKVOwner = [self \in SourceSessions |-> Ownership(SKVRanges[self], 0)]
         (* Process TargetProcess *)
         /\ TKVRanges = [self \in TargetSessions |-> {TargetKeys}]
         /\ MigratingRanges = [self \in TargetSessions |-> NULL]
+        /\ TKVOwner = [self \in TargetSessions |-> Ownership(TKVRanges[self], 0)]
         (* Process CoordinatorProcess *)
-        /\ ServerReply = [Source |-> NULL, Target |-> NULL]
+        /\ ServerVote = [Source |-> NULL, Target |-> NULL]
         /\ pc = [self \in ProcSet |-> CASE self \in SourceSessions -> "InitMigrationSource"
                                         [] self \in TargetSessions -> "InitMigrationTarget"
                                         [] self = Zookeeper -> "Init2PC"]
@@ -197,12 +204,13 @@ InitMigrationSource(self) == /\ pc[self] = "InitMigrationSource"
                                              TakeOwnershipRPC, 
                                              TransferCompleteRPC, 
                                              ACKTransferCompleteRPC, Start2PC, 
-                                             ServerPrepare2PC, 
-                                             TargetPrepare2PC, ServerACK, 
-                                             TargetACK, ServerCommit, 
+                                             SourcePrepare2PC, 
+                                             TargetPrepare2PC, SourceACK, 
+                                             TargetACK, SourceCommit, 
                                              TargetCommit, SKVRanges, 
-                                             TransferComplete, TKVRanges, 
-                                             MigratingRanges, ServerReply >>
+                                             TransferComplete, SKVOwner, 
+                                             TKVRanges, MigratingRanges, 
+                                             TKVOwner, ServerVote >>
 
 SampleRecords(self) == /\ pc[self] = "SampleRecords"
                        /\ ServerState' = [ServerState EXCEPT ![self] = Sampling]
@@ -211,18 +219,18 @@ SampleRecords(self) == /\ pc[self] = "SampleRecords"
                                        MigrationRange, PrepForTransferRPC, 
                                        TakeOwnershipRPC, TransferCompleteRPC, 
                                        ACKTransferCompleteRPC, Start2PC, 
-                                       ServerPrepare2PC, TargetPrepare2PC, 
-                                       ServerACK, TargetACK, ServerCommit, 
+                                       SourcePrepare2PC, TargetPrepare2PC, 
+                                       SourceACK, TargetACK, SourceCommit, 
                                        TargetCommit, SKVRanges, 
-                                       TransferComplete, TKVRanges, 
-                                       MigratingRanges, ServerReply >>
+                                       TransferComplete, SKVOwner, TKVRanges, 
+                                       MigratingRanges, TKVOwner, ServerVote >>
 
 ViewChange(self) == /\ pc[self] = "ViewChange"
                     /\ ServerState' = [ServerState EXCEPT ![self] = PrepareForTransfer]
                     /\ SViewNumber' = [SViewNumber EXCEPT ![self] = SViewNumber[self] + 1]
                     /\ IF ~PrepForTransferRPC
-                          THEN /\ PrepForTransferRPC' = TRUE
-                               /\ MigrationRange' = KeysToMigrate
+                          THEN /\ MigrationRange' = KeysToMigrate
+                               /\ PrepForTransferRPC' = TRUE
                           ELSE /\ TRUE
                                /\ UNCHANGED << MigrationRange, 
                                                PrepForTransferRPC >>
@@ -230,10 +238,11 @@ ViewChange(self) == /\ pc[self] = "ViewChange"
                     /\ UNCHANGED << TViewNumber, TakeOwnershipRPC, 
                                     TransferCompleteRPC, 
                                     ACKTransferCompleteRPC, Start2PC, 
-                                    ServerPrepare2PC, TargetPrepare2PC, 
-                                    ServerACK, TargetACK, ServerCommit, 
+                                    SourcePrepare2PC, TargetPrepare2PC, 
+                                    SourceACK, TargetACK, SourceCommit, 
                                     TargetCommit, SKVRanges, TransferComplete, 
-                                    TKVRanges, MigratingRanges, ServerReply >>
+                                    SKVOwner, TKVRanges, MigratingRanges, 
+                                    TKVOwner, ServerVote >>
 
 TransferOwnership(self) == /\ pc[self] = "TransferOwnership"
                            /\ ServerState' = [ServerState EXCEPT ![self] = TransferingOwnership]
@@ -243,11 +252,12 @@ TransferOwnership(self) == /\ pc[self] = "TransferOwnership"
                                            TakeOwnershipRPC, 
                                            TransferCompleteRPC, 
                                            ACKTransferCompleteRPC, Start2PC, 
-                                           ServerPrepare2PC, TargetPrepare2PC, 
-                                           ServerACK, TargetACK, ServerCommit, 
+                                           SourcePrepare2PC, TargetPrepare2PC, 
+                                           SourceACK, TargetACK, SourceCommit, 
                                            TargetCommit, SKVRanges, 
-                                           TransferComplete, TKVRanges, 
-                                           MigratingRanges, ServerReply >>
+                                           TransferComplete, SKVOwner, 
+                                           TKVRanges, MigratingRanges, 
+                                           TKVOwner, ServerVote >>
 
 CompleteRequests(self) == /\ pc[self] = "CompleteRequests"
                           /\ ServerState' = [ServerState EXCEPT ![self] = WaitForPending]
@@ -262,17 +272,19 @@ CompleteRequests(self) == /\ pc[self] = "CompleteRequests"
                                           MigrationRange, PrepForTransferRPC, 
                                           TransferCompleteRPC, 
                                           ACKTransferCompleteRPC, Start2PC, 
-                                          ServerPrepare2PC, TargetPrepare2PC, 
-                                          ServerACK, TargetACK, ServerCommit, 
+                                          SourcePrepare2PC, TargetPrepare2PC, 
+                                          SourceACK, TargetACK, SourceCommit, 
                                           TargetCommit, SKVRanges, 
-                                          TransferComplete, TKVRanges, 
-                                          MigratingRanges, ServerReply >>
+                                          TransferComplete, SKVOwner, 
+                                          TKVRanges, MigratingRanges, TKVOwner, 
+                                          ServerVote >>
 
 MoveData(self) == /\ pc[self] = "MoveData"
                   /\ SKVRanges' = [SKVRanges EXCEPT ![self] = SKVRanges[self] \ {KeysToMigrate}]
                   /\ ServerState' = [ServerState EXCEPT ![self] = MoveDataToTarget]
                   /\ \E sessions \in SourceSessions:
                        ServerState'[sessions] = MoveDataToTarget
+                  /\ SKVOwner' = [SKVOwner EXCEPT ![self] = Ownership(SKVRanges'[self], SViewNumber[self])]
                   /\ IF ~TransferComplete[self]
                         THEN /\ TransferComplete' = [TransferComplete EXCEPT ![self] = TRUE]
                         ELSE /\ TRUE
@@ -281,10 +293,10 @@ MoveData(self) == /\ pc[self] = "MoveData"
                   /\ UNCHANGED << SViewNumber, TViewNumber, MigrationRange, 
                                   PrepForTransferRPC, TakeOwnershipRPC, 
                                   TransferCompleteRPC, ACKTransferCompleteRPC, 
-                                  Start2PC, ServerPrepare2PC, TargetPrepare2PC, 
-                                  ServerACK, TargetACK, ServerCommit, 
+                                  Start2PC, SourcePrepare2PC, TargetPrepare2PC, 
+                                  SourceACK, TargetACK, SourceCommit, 
                                   TargetCommit, TKVRanges, MigratingRanges, 
-                                  ServerReply >>
+                                  TKVOwner, ServerVote >>
 
 CompleteMigration(self) == /\ pc[self] = "CompleteMigration"
                            /\ TransferComplete[self]
@@ -295,11 +307,12 @@ CompleteMigration(self) == /\ pc[self] = "CompleteMigration"
                                            TakeOwnershipRPC, 
                                            TransferCompleteRPC, 
                                            ACKTransferCompleteRPC, Start2PC, 
-                                           ServerPrepare2PC, TargetPrepare2PC, 
-                                           ServerACK, TargetACK, ServerCommit, 
+                                           SourcePrepare2PC, TargetPrepare2PC, 
+                                           SourceACK, TargetACK, SourceCommit, 
                                            TargetCommit, SKVRanges, 
-                                           TransferComplete, TKVRanges, 
-                                           MigratingRanges, ServerReply >>
+                                           TransferComplete, SKVOwner, 
+                                           TKVRanges, MigratingRanges, 
+                                           TKVOwner, ServerVote >>
 
 StartCommit(self) == /\ pc[self] = "StartCommit"
                      /\ ACKTransferCompleteRPC
@@ -308,28 +321,29 @@ StartCommit(self) == /\ pc[self] = "StartCommit"
                      /\ UNCHANGED << ServerState, SViewNumber, TViewNumber, 
                                      MigrationRange, PrepForTransferRPC, 
                                      TakeOwnershipRPC, TransferCompleteRPC, 
-                                     ACKTransferCompleteRPC, ServerPrepare2PC, 
-                                     TargetPrepare2PC, ServerACK, TargetACK, 
-                                     ServerCommit, TargetCommit, SKVRanges, 
-                                     TransferComplete, TKVRanges, 
-                                     MigratingRanges, ServerReply >>
+                                     ACKTransferCompleteRPC, SourcePrepare2PC, 
+                                     TargetPrepare2PC, SourceACK, TargetACK, 
+                                     SourceCommit, TargetCommit, SKVRanges, 
+                                     TransferComplete, SKVOwner, TKVRanges, 
+                                     MigratingRanges, TKVOwner, ServerVote >>
 
 WaitForPrepare(self) == /\ pc[self] = "WaitForPrepare"
-                        /\ ServerPrepare2PC
-                        /\ ServerACK' = TRUE
+                        /\ SourcePrepare2PC
+                        /\ SourceACK' = TRUE
                         /\ ServerState' = [ServerState EXCEPT ![self] = 2PCPrepare]
                         /\ pc' = [pc EXCEPT ![self] = "WaitForDecisionSource"]
                         /\ UNCHANGED << SViewNumber, TViewNumber, 
                                         MigrationRange, PrepForTransferRPC, 
                                         TakeOwnershipRPC, TransferCompleteRPC, 
                                         ACKTransferCompleteRPC, Start2PC, 
-                                        ServerPrepare2PC, TargetPrepare2PC, 
-                                        TargetACK, ServerCommit, TargetCommit, 
-                                        SKVRanges, TransferComplete, TKVRanges, 
-                                        MigratingRanges, ServerReply >>
+                                        SourcePrepare2PC, TargetPrepare2PC, 
+                                        TargetACK, SourceCommit, TargetCommit, 
+                                        SKVRanges, TransferComplete, SKVOwner, 
+                                        TKVRanges, MigratingRanges, TKVOwner, 
+                                        ServerVote >>
 
 WaitForDecisionSource(self) == /\ pc[self] = "WaitForDecisionSource"
-                               /\ ServerCommit
+                               /\ SourceCommit
                                /\ ServerState' = [ServerState EXCEPT ![self] = 2PCCommit]
                                /\ pc' = [pc EXCEPT ![self] = "Done"]
                                /\ UNCHANGED << SViewNumber, TViewNumber, 
@@ -338,12 +352,13 @@ WaitForDecisionSource(self) == /\ pc[self] = "WaitForDecisionSource"
                                                TakeOwnershipRPC, 
                                                TransferCompleteRPC, 
                                                ACKTransferCompleteRPC, 
-                                               Start2PC, ServerPrepare2PC, 
-                                               TargetPrepare2PC, ServerACK, 
-                                               TargetACK, ServerCommit, 
+                                               Start2PC, SourcePrepare2PC, 
+                                               TargetPrepare2PC, SourceACK, 
+                                               TargetACK, SourceCommit, 
                                                TargetCommit, SKVRanges, 
-                                               TransferComplete, TKVRanges, 
-                                               MigratingRanges, ServerReply >>
+                                               TransferComplete, SKVOwner, 
+                                               TKVRanges, MigratingRanges, 
+                                               TKVOwner, ServerVote >>
 
 SourceProcess(self) == InitMigrationSource(self) \/ SampleRecords(self)
                           \/ ViewChange(self) \/ TransferOwnership(self)
@@ -356,34 +371,35 @@ InitMigrationTarget(self) == /\ pc[self] = "InitMigrationTarget"
                              /\ PrepForTransferRPC
                              /\ ServerState' = [ServerState EXCEPT ![self] = PrepareForMigration]
                              /\ MigratingRanges' = [MigratingRanges EXCEPT ![self] = MigrationRange]
+                             /\ TViewNumber' = [TViewNumber EXCEPT ![self] = TViewNumber[self] + 1]
                              /\ pc' = [pc EXCEPT ![self] = "TakeOwnership"]
-                             /\ UNCHANGED << SViewNumber, TViewNumber, 
-                                             MigrationRange, 
+                             /\ UNCHANGED << SViewNumber, MigrationRange, 
                                              PrepForTransferRPC, 
                                              TakeOwnershipRPC, 
                                              TransferCompleteRPC, 
                                              ACKTransferCompleteRPC, Start2PC, 
-                                             ServerPrepare2PC, 
-                                             TargetPrepare2PC, ServerACK, 
-                                             TargetACK, ServerCommit, 
+                                             SourcePrepare2PC, 
+                                             TargetPrepare2PC, SourceACK, 
+                                             TargetACK, SourceCommit, 
                                              TargetCommit, SKVRanges, 
-                                             TransferComplete, TKVRanges, 
-                                             ServerReply >>
+                                             TransferComplete, SKVOwner, 
+                                             TKVRanges, TKVOwner, ServerVote >>
 
 TakeOwnership(self) == /\ pc[self] = "TakeOwnership"
                        /\ TakeOwnershipRPC
                        /\ TKVRanges' = [TKVRanges EXCEPT ![self] = TKVRanges[self] \union {MigratingRanges[self]}]
                        /\ ServerState' = [ServerState EXCEPT ![self] = ReceivingData]
+                       /\ TKVOwner' = [TKVOwner EXCEPT ![self] = Ownership(TKVRanges'[self], TViewNumber[self])]
                        /\ pc' = [pc EXCEPT ![self] = "StartCheckpointing"]
                        /\ UNCHANGED << SViewNumber, TViewNumber, 
                                        MigrationRange, PrepForTransferRPC, 
                                        TakeOwnershipRPC, TransferCompleteRPC, 
                                        ACKTransferCompleteRPC, Start2PC, 
-                                       ServerPrepare2PC, TargetPrepare2PC, 
-                                       ServerACK, TargetACK, ServerCommit, 
+                                       SourcePrepare2PC, TargetPrepare2PC, 
+                                       SourceACK, TargetACK, SourceCommit, 
                                        TargetCommit, SKVRanges, 
-                                       TransferComplete, MigratingRanges, 
-                                       ServerReply >>
+                                       TransferComplete, SKVOwner, 
+                                       MigratingRanges, ServerVote >>
 
 StartCheckpointing(self) == /\ pc[self] = "StartCheckpointing"
                             /\ TransferCompleteRPC
@@ -394,11 +410,12 @@ StartCheckpointing(self) == /\ pc[self] = "StartCheckpointing"
                                             MigrationRange, PrepForTransferRPC, 
                                             TakeOwnershipRPC, 
                                             TransferCompleteRPC, Start2PC, 
-                                            ServerPrepare2PC, TargetPrepare2PC, 
-                                            ServerACK, TargetACK, ServerCommit, 
+                                            SourcePrepare2PC, TargetPrepare2PC, 
+                                            SourceACK, TargetACK, SourceCommit, 
                                             TargetCommit, SKVRanges, 
-                                            TransferComplete, TKVRanges, 
-                                            MigratingRanges, ServerReply >>
+                                            TransferComplete, SKVOwner, 
+                                            TKVRanges, MigratingRanges, 
+                                            TKVOwner, ServerVote >>
 
 WaitFor2PC(self) == /\ pc[self] = "WaitFor2PC"
                     /\ TargetPrepare2PC
@@ -409,10 +426,11 @@ WaitFor2PC(self) == /\ pc[self] = "WaitFor2PC"
                                     PrepForTransferRPC, TakeOwnershipRPC, 
                                     TransferCompleteRPC, 
                                     ACKTransferCompleteRPC, Start2PC, 
-                                    ServerPrepare2PC, TargetPrepare2PC, 
-                                    ServerACK, ServerCommit, TargetCommit, 
-                                    SKVRanges, TransferComplete, TKVRanges, 
-                                    MigratingRanges, ServerReply >>
+                                    SourcePrepare2PC, TargetPrepare2PC, 
+                                    SourceACK, SourceCommit, TargetCommit, 
+                                    SKVRanges, TransferComplete, SKVOwner, 
+                                    TKVRanges, MigratingRanges, TKVOwner, 
+                                    ServerVote >>
 
 WaitForDecisionTarget(self) == /\ pc[self] = "WaitForDecisionTarget"
                                /\ TargetCommit
@@ -424,12 +442,13 @@ WaitForDecisionTarget(self) == /\ pc[self] = "WaitForDecisionTarget"
                                                TakeOwnershipRPC, 
                                                TransferCompleteRPC, 
                                                ACKTransferCompleteRPC, 
-                                               Start2PC, ServerPrepare2PC, 
-                                               TargetPrepare2PC, ServerACK, 
-                                               TargetACK, ServerCommit, 
+                                               Start2PC, SourcePrepare2PC, 
+                                               TargetPrepare2PC, SourceACK, 
+                                               TargetACK, SourceCommit, 
                                                TargetCommit, SKVRanges, 
-                                               TransferComplete, TKVRanges, 
-                                               MigratingRanges, ServerReply >>
+                                               TransferComplete, SKVOwner, 
+                                               TKVRanges, MigratingRanges, 
+                                               TKVOwner, ServerVote >>
 
 TargetProcess(self) == InitMigrationTarget(self) \/ TakeOwnership(self)
                           \/ StartCheckpointing(self) \/ WaitFor2PC(self)
@@ -437,30 +456,32 @@ TargetProcess(self) == InitMigrationTarget(self) \/ TakeOwnership(self)
 
 Init2PC == /\ pc[Zookeeper] = "Init2PC"
            /\ Start2PC
-           /\ ServerPrepare2PC' = TRUE
+           /\ SourcePrepare2PC' = TRUE
            /\ TargetPrepare2PC' = TRUE
            /\ pc' = [pc EXCEPT ![Zookeeper] = "CompletionDecision"]
            /\ UNCHANGED << ServerState, SViewNumber, TViewNumber, 
                            MigrationRange, PrepForTransferRPC, 
                            TakeOwnershipRPC, TransferCompleteRPC, 
-                           ACKTransferCompleteRPC, Start2PC, ServerACK, 
-                           TargetACK, ServerCommit, TargetCommit, SKVRanges, 
-                           TransferComplete, TKVRanges, MigratingRanges, 
-                           ServerReply >>
+                           ACKTransferCompleteRPC, Start2PC, SourceACK, 
+                           TargetACK, SourceCommit, TargetCommit, SKVRanges, 
+                           TransferComplete, SKVOwner, TKVRanges, 
+                           MigratingRanges, TKVOwner, ServerVote >>
 
 CompletionDecision == /\ pc[Zookeeper] = "CompletionDecision"
-                      /\ ServerACK /\ TargetACK
-                      /\ ServerCommit' = TRUE
+                      /\ SourceACK /\ TargetACK
+                      /\ SourceCommit' = TRUE
                       /\ TargetCommit' = TRUE
+                      /\ ServerVote' = [ServerVote EXCEPT ![Source] = SourceCommit',
+                                                          ![Target] = TargetCommit']
                       /\ pc' = [pc EXCEPT ![Zookeeper] = "Done"]
                       /\ UNCHANGED << ServerState, SViewNumber, TViewNumber, 
                                       MigrationRange, PrepForTransferRPC, 
                                       TakeOwnershipRPC, TransferCompleteRPC, 
                                       ACKTransferCompleteRPC, Start2PC, 
-                                      ServerPrepare2PC, TargetPrepare2PC, 
-                                      ServerACK, TargetACK, SKVRanges, 
-                                      TransferComplete, TKVRanges, 
-                                      MigratingRanges, ServerReply >>
+                                      SourcePrepare2PC, TargetPrepare2PC, 
+                                      SourceACK, TargetACK, SKVRanges, 
+                                      TransferComplete, SKVOwner, TKVRanges, 
+                                      MigratingRanges, TKVOwner >>
 
 CoordinatorProcess == Init2PC \/ CompletionDecision
 
@@ -481,5 +502,5 @@ Termination == <>(\A self \in ProcSet: pc[self] = "Done")
 
 =============================================================================
 \* Modification History
-\* Last modified Mon Feb 04 16:19:40 MST 2019 by aarushi
+\* Last modified Tue Feb 05 15:31:09 MST 2019 by aarushi
 \* Created Thu Jan 17 10:53:34 MST 2019 by aarushi
