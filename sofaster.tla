@@ -100,6 +100,7 @@ fair process SourceServer = Source
         with s \in SourceSessions do
             ServerState[s] := WaitForCheckpoint
         end with;
+        TransferCompleteRPC := TRUE;
     StartCommit:
         await ACKTransferCompleteRPC;
         Start2PC := TRUE;
@@ -376,11 +377,11 @@ CompleteMigration == /\ pc[Source] = "CompleteMigration"
                      /\ TransferComplete
                      /\ \E s \in SourceSessions:
                           ServerState' = [ServerState EXCEPT ![s] = WaitForCheckpoint]
+                     /\ TransferCompleteRPC' = TRUE
                      /\ pc' = [pc EXCEPT ![Source] = "StartCommit"]
                      /\ UNCHANGED << SViewNumber, TViewNumber, ServerVote, 
                                      MigrationRange, TransferComplete, 
                                      PrepForTransferRPC, TakeOwnershipRPC, 
-                                     TransferCompleteRPC, 
                                      ACKTransferCompleteRPC, Start2PC, 
                                      SourcePrepare2PC, TargetPrepare2PC, 
                                      SKVRanges, SKVOwner, TKVRanges, 
@@ -609,5 +610,5 @@ AtomicMigration ==
 
 =============================================================================
 \* Modification History
-\* Last modified Fri Feb 08 17:40:03 MST 2019 by aarushi
+\* Last modified Fri Feb 08 18:19:21 MST 2019 by aarushi
 \* Created Thu Jan 17 10:53:34 MST 2019 by aarushi
