@@ -67,6 +67,7 @@ fair process SourceProcess \in SourceSessions
         \* Change view from v to v+1
         ServerState[self] := PrepareForTransfer;
         SViewNumber[self] := SViewNumber[self] + 1;
+        SKVOwner := Ownership(SKVRanges \ KeysToMigrate, SViewNumber[self]);
         if ~PrepForTransferRPC then
             \* inform target about migrating ranges
             MigrationRange := KeysToMigrate;
@@ -91,7 +92,6 @@ fair process SourceProcess \in SourceSessions
         with sessions \in SourceSessions do
             await ServerState[sessions] = MoveDataToTarget
         end with;
-        SKVOwner := Ownership(SKVRanges, SViewNumber[self]); \* Which view are the remaining records in?
         if ~TransferComplete then
             TransferComplete := TRUE;
             \*UpdateZookeeper(Source, SViewNumber[self], SKVRanges);
@@ -152,12 +152,12 @@ fair process TargetProcess \in TargetSessions
         ServerState[self] := PrepareForMigration;
         MigratingRanges := MigrationRange;
         TViewNumber[self] := TViewNumber[self] + 1;
+        TKVRanges := TKVRanges \union {MigratingRanges};
+        TKVOwner := Ownership(TKVRanges, TViewNumber[self]);
     TakeOwnership:
         await TakeOwnershipRPC;
         \* Enter received records
-        TKVRanges := TKVRanges \union {MigratingRanges};
         ServerState[self] := ReceivingData;
-        TKVOwner := Ownership(TKVRanges, TViewNumber[self]);
         \*UpdateZookeeper(Target, TViewNumber[self], TKVRanges);
         \* TODO: Start executing requests
 end process;
@@ -331,6 +331,7 @@ SampleRecords(self) == /\ pc[self] = "SampleRecords"
 ViewChange(self) == /\ pc[self] = "ViewChange"
                     /\ ServerState' = [ServerState EXCEPT ![self] = PrepareForTransfer]
                     /\ SViewNumber' = [SViewNumber EXCEPT ![self] = SViewNumber[self] + 1]
+                    /\ SKVOwner' = [SKVOwner EXCEPT ![self] = Ownership(SKVRanges[self] \ KeysToMigrate, SViewNumber'[self])]
                     /\ IF ~PrepForTransferRPC
                           THEN /\ MigrationRange' = KeysToMigrate
                                /\ PrepForTransferRPC' = TRUE
@@ -342,8 +343,8 @@ ViewChange(self) == /\ pc[self] = "ViewChange"
                                     TakeOwnershipRPC, TransferCompleteRPC, 
                                     ACKTransferCompleteRPC, Start2PC, 
                                     SourcePrepare2PC, TargetPrepare2PC, 
-                                    SourceACK, TargetACK, SKVRanges, SKVOwner, 
-                                    TKVRanges, MigratingRanges, TKVOwner >>
+                                    SourceACK, TargetACK, SKVRanges, TKVRanges, 
+                                    MigratingRanges, TKVOwner >>
 
 TransferOwnership(self) == /\ pc[self] = "TransferOwnership"
                            /\ ServerState' = [ServerState EXCEPT ![self] = TransferingOwnership]
@@ -384,7 +385,6 @@ MoveData(self) == /\ pc[self] = "MoveData"
                   /\ ServerState' = [ServerState EXCEPT ![self] = MoveDataToTarget]
                   /\ \E sessions \in SourceSessions:
                        ServerState'[sessions] = MoveDataToTarget
-                  /\ SKVOwner' = [SKVOwner EXCEPT ![self] = Ownership(SKVRanges'[self], SViewNumber[self])]
                   /\ IF ~TransferComplete
                         THEN /\ TransferComplete' = TRUE
                         ELSE /\ TRUE
@@ -395,7 +395,7 @@ MoveData(self) == /\ pc[self] = "MoveData"
                                   TakeOwnershipRPC, TransferCompleteRPC, 
                                   ACKTransferCompleteRPC, Start2PC, 
                                   SourcePrepare2PC, TargetPrepare2PC, 
-                                  SourceACK, TargetACK, TKVRanges, 
+                                  SourceACK, TargetACK, SKVOwner, TKVRanges, 
                                   MigratingRanges, TKVOwner >>
 
 SourceProcess(self) == InitMigrationSource(self) \/ SampleRecords(self)
@@ -485,6 +485,8 @@ InitMigrationTarget(self) == /\ pc[self] = "InitMigrationTarget"
                              /\ ServerState' = [ServerState EXCEPT ![self] = PrepareForMigration]
                              /\ MigratingRanges' = [MigratingRanges EXCEPT ![self] = MigrationRange]
                              /\ TViewNumber' = [TViewNumber EXCEPT ![self] = TViewNumber[self] + 1]
+                             /\ TKVRanges' = [TKVRanges EXCEPT ![self] = TKVRanges[self] \union {MigratingRanges'[self]}]
+                             /\ TKVOwner' = [TKVOwner EXCEPT ![self] = Ownership(TKVRanges'[self], TViewNumber'[self])]
                              /\ pc' = [pc EXCEPT ![self] = "TakeOwnership"]
                              /\ UNCHANGED << SViewNumber, ServerVote, 
                                              MigrationRange, TransferComplete, 
@@ -494,14 +496,11 @@ InitMigrationTarget(self) == /\ pc[self] = "InitMigrationTarget"
                                              ACKTransferCompleteRPC, Start2PC, 
                                              SourcePrepare2PC, 
                                              TargetPrepare2PC, SourceACK, 
-                                             TargetACK, SKVRanges, SKVOwner, 
-                                             TKVRanges, TKVOwner >>
+                                             TargetACK, SKVRanges, SKVOwner >>
 
 TakeOwnership(self) == /\ pc[self] = "TakeOwnership"
                        /\ TakeOwnershipRPC
-                       /\ TKVRanges' = [TKVRanges EXCEPT ![self] = TKVRanges[self] \union {MigratingRanges[self]}]
                        /\ ServerState' = [ServerState EXCEPT ![self] = ReceivingData]
-                       /\ TKVOwner' = [TKVOwner EXCEPT ![self] = Ownership(TKVRanges'[self], TViewNumber[self])]
                        /\ pc' = [pc EXCEPT ![self] = "Done"]
                        /\ UNCHANGED << SViewNumber, TViewNumber, ServerVote, 
                                        MigrationRange, TransferComplete, 
@@ -510,7 +509,8 @@ TakeOwnership(self) == /\ pc[self] = "TakeOwnership"
                                        ACKTransferCompleteRPC, Start2PC, 
                                        SourcePrepare2PC, TargetPrepare2PC, 
                                        SourceACK, TargetACK, SKVRanges, 
-                                       SKVOwner, MigratingRanges >>
+                                       SKVOwner, TKVRanges, MigratingRanges, 
+                                       TKVOwner >>
 
 TargetProcess(self) == InitMigrationTarget(self) \/ TakeOwnership(self)
 
@@ -661,5 +661,5 @@ Termination == <>(\A self \in ProcSet: pc[self] = "Done")
 *)
 =============================================================================
 \* Modification History
-\* Last modified Wed Feb 13 13:51:08 MST 2019 by aarushi
+\* Last modified Wed Feb 13 18:22:30 MST 2019 by aarushi
 \* Created Thu Jan 17 10:53:34 MST 2019 by aarushi
