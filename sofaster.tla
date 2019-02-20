@@ -141,7 +141,6 @@ fair process SourceServer = Source
                     ServerState[s] := 2PCAbort
                 end with;
             end if;
-            SourceDecision := TRUE;
         end if;
 end process;
 
@@ -200,7 +199,6 @@ fair process TargetServer = Target
                     ServerState[s] := 2PCAbort
                 end with;
             end if;
-            TargetDecision := TRUE;
         end if;
 end process;
 
@@ -256,8 +254,6 @@ fair process CoordinatorProcess = Zookeeper
             end if;
         end either;
         DecisionMade := TRUE;
-    CloseZookeeper:
-        await SourceDecision /\ TargetDecision;
 end process; 
 
 end algorithm; *)
@@ -482,10 +478,8 @@ WaitForDecisionSource == /\ pc[Source] = "WaitForDecisionSource"
                                                     ServerState' = [ServerState EXCEPT ![s] = 2PCCommit]
                                           ELSE /\ \E s \in SourceSessions:
                                                     ServerState' = [ServerState EXCEPT ![s] = 2PCAbort]
-                                    /\ SourceDecision' = TRUE
                                ELSE /\ TRUE
-                                    /\ UNCHANGED << ServerState, 
-                                                    SourceDecision >>
+                                    /\ UNCHANGED ServerState
                          /\ pc' = [pc EXCEPT ![Source] = "Done"]
                          /\ UNCHANGED << SViewNumber, TViewNumber, ServerVote, 
                                          MigrationRange, TransferComplete, 
@@ -494,8 +488,9 @@ WaitForDecisionSource == /\ pc[Source] = "WaitForDecisionSource"
                                          ACKTransferCompleteRPC, Start2PC, 
                                          SourcePrepare2PC, TargetPrepare2PC, 
                                          SourceACK, TargetACK, DecisionMade, 
-                                         TargetDecision, SKVRanges, SKVOwner, 
-                                         TKVRanges, MigratingRanges, TKVOwner >>
+                                         SourceDecision, TargetDecision, 
+                                         SKVRanges, SKVOwner, TKVRanges, 
+                                         MigratingRanges, TKVOwner >>
 
 SourceServer == CompleteMigration \/ StartCommit \/ WaitForPrepare
                    \/ WaitForDecisionSource
@@ -581,10 +576,8 @@ WaitForDecisionTarget == /\ pc[Target] = "WaitForDecisionTarget"
                                                     ServerState' = [ServerState EXCEPT ![s] = 2PCCommit]
                                           ELSE /\ \E s \in TargetSessions:
                                                     ServerState' = [ServerState EXCEPT ![s] = 2PCAbort]
-                                    /\ TargetDecision' = TRUE
                                ELSE /\ TRUE
-                                    /\ UNCHANGED << ServerState, 
-                                                    TargetDecision >>
+                                    /\ UNCHANGED ServerState
                          /\ pc' = [pc EXCEPT ![Target] = "Done"]
                          /\ UNCHANGED << SViewNumber, TViewNumber, ServerVote, 
                                          MigrationRange, TransferComplete, 
@@ -593,8 +586,9 @@ WaitForDecisionTarget == /\ pc[Target] = "WaitForDecisionTarget"
                                          ACKTransferCompleteRPC, Start2PC, 
                                          SourcePrepare2PC, TargetPrepare2PC, 
                                          SourceACK, TargetACK, DecisionMade, 
-                                         SourceDecision, SKVRanges, SKVOwner, 
-                                         TKVRanges, MigratingRanges, TKVOwner >>
+                                         SourceDecision, TargetDecision, 
+                                         SKVRanges, SKVOwner, TKVRanges, 
+                                         MigratingRanges, TKVOwner >>
 
 TargetServer == StartCheckpointing \/ WaitFor2PC \/ WaitForDecisionTarget
 
@@ -635,7 +629,7 @@ CompletionDecision == /\ pc[Zookeeper] = "CompletionDecision"
                                                         ELSE /\ TRUE
                                                              /\ UNCHANGED ServerVote
                       /\ DecisionMade' = TRUE
-                      /\ pc' = [pc EXCEPT ![Zookeeper] = "CloseZookeeper"]
+                      /\ pc' = [pc EXCEPT ![Zookeeper] = "Done"]
                       /\ UNCHANGED << ServerState, SViewNumber, TViewNumber, 
                                       MigrationRange, TransferComplete, 
                                       PrepForTransferRPC, TakeOwnershipRPC, 
@@ -646,20 +640,7 @@ CompletionDecision == /\ pc[Zookeeper] = "CompletionDecision"
                                       TargetDecision, SKVRanges, SKVOwner, 
                                       TKVRanges, MigratingRanges, TKVOwner >>
 
-CloseZookeeper == /\ pc[Zookeeper] = "CloseZookeeper"
-                  /\ SourceDecision /\ TargetDecision
-                  /\ pc' = [pc EXCEPT ![Zookeeper] = "Done"]
-                  /\ UNCHANGED << ServerState, SViewNumber, TViewNumber, 
-                                  ServerVote, MigrationRange, TransferComplete, 
-                                  PrepForTransferRPC, TakeOwnershipRPC, 
-                                  TransferCompleteRPC, ACKTransferCompleteRPC, 
-                                  Start2PC, SourcePrepare2PC, TargetPrepare2PC, 
-                                  SourceACK, TargetACK, DecisionMade, 
-                                  SourceDecision, TargetDecision, SKVRanges, 
-                                  SKVOwner, TKVRanges, MigratingRanges, 
-                                  TKVOwner >>
-
-CoordinatorProcess == Init2PC \/ CompletionDecision \/ CloseZookeeper
+CoordinatorProcess == Init2PC \/ CompletionDecision
 
 Next == SourceServer \/ TargetServer \/ CoordinatorProcess
            \/ (\E self \in SourceSessions: SourceProcess(self))
@@ -693,5 +674,5 @@ Termination == <>(\A self \in ProcSet: pc[self] = "Done")
 *)
 =============================================================================
 \* Modification History
-\* Last modified Wed Feb 20 11:07:47 MST 2019 by aarushi
+\* Last modified Wed Feb 20 12:14:35 MST 2019 by aarushi
 \* Created Thu Jan 17 10:53:34 MST 2019 by aarushi
