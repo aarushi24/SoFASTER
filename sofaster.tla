@@ -9,7 +9,7 @@ Ownership(kvset, view) == [kv \in kvset |-> view]
 
 SetServerState == [s \in SourceSessions \union TargetSessions |-> NULL]
 
-SetViewNumber(ServerSessions) == [s \in ServerSessions |-> 0]
+SetViewNumber(ServerElements) == [s \in ServerElements |-> 0]
 
 SetServerVote == [s \in Servers |-> FALSE]
 
@@ -31,6 +31,8 @@ variables
     SourceACK = NULL,
     TargetACK = NULL,
     \* Public Zookeeper State and RPCs
+    AllServerRanges = [Source |-> NULL, Target |-> NULL],
+    AllServerViewNumbers = SetViewNumber(Servers),
     MigrationServers = <<>>,
     MigrationViewNumbers = <<>>,
     MigrationRange = NULL,
@@ -51,6 +53,18 @@ define \* invariants
     \* No key has overlapping ownership - KeysToMigrate are never owned by both Source and Target
 end define;
 
+macro UpdateZookeeperState()
+  begin
+    with s \in Servers do
+        if ~ServerVote[s] then
+            AllServerRanges[Head(MigrationServers)] := AllServerRanges[Head(MigrationServers)] \union MigrationRange 
+            || AllServerRanges[Head(Tail(MigrationServers))] := AllServerRanges[Head(Tail(MigrationServers))] \ MigrationRange;
+            AllServerViewNumbers[Head(MigrationServers)] := Head(MigrationViewNumbers) 
+            || AllServerViewNumbers[Head(Tail(MigrationServers))] := Head(Tail(MigrationViewNumbers));
+        end if;
+    end with;
+end macro;
+
 \* All local view numbers start at the last CPR checkpoint (0)
 \* Keep history of views from the last checkpoint? [key -> [view ranges, client sessions]]; This will be on a per thread basis?
 
@@ -59,6 +73,8 @@ fair process SourceProcess \in SourceSessions
     variable SKVRanges = {SourceKeys, KeysToMigrate}, SKVOwner = Ownership(SKVRanges, 0);
   begin
     InitMigrationSource: 
+        AllServerRanges[Source] := SKVRanges;
+        AllServerViewNumbers[Source] := SViewNumber[self];
         \* Shared latch on mutable records 
         ServerState[self] := PrepareToSample;
     SampleRecords:
@@ -73,9 +89,16 @@ fair process SourceProcess \in SourceSessions
         if ~PrepForTransferRPC then
             \* inform target about migrating ranges
             MigrationRange := KeysToMigrate;
-            MigrationServers := Append(MigrationServers, Source);
-            MigrationViewNumbers := Append(MigrationViewNumbers, SViewNumber[self]);
             PrepForTransferRPC := TRUE;
+        end if;
+    SetZookeerperStateSource:
+        if ~UpdateSourceOwnership then
+            UpdateSourceOwnership := TRUE;    
+            with sessions \in SourceSessions \ {self} do
+                    await ServerState[sessions] = PrepareForTransfer
+            end with;
+            MigrationServers := Append(MigrationServers, Source);
+            MigrationViewNumbers := Append(MigrationViewNumbers, SViewNumber[self]);    
         end if;
     TransferOwnership:
         \* TODO: Inform all clients
@@ -149,16 +172,26 @@ end process;
 fair process TargetProcess \in TargetSessions
     variable TKVRanges = {TargetKeys}, MigratingRanges = NULL, TKVOwner = Ownership(TKVRanges, 0);
   begin
-    InitMigrationTarget:
+    InitState:
+        AllServerRanges[Target] := TKVRanges;
+        AllServerViewNumbers[Target] := TViewNumber[self];
+    InitMigrationTarget:        
         await PrepForTransferRPC;
         \* TODO: Buffer requests for migrating ranges
         ServerState[self] := PrepareForMigration;
         TViewNumber[self] := TViewNumber[self] + 1;
-        MigrationServers := Append(MigrationServers, Target);
-        MigrationViewNumbers := Append(MigrationViewNumbers, TViewNumber[self]);
         MigratingRanges := MigrationRange;
         TKVRanges := TKVRanges \union {MigratingRanges};
         TKVOwner := Ownership(TKVRanges, TViewNumber[self]);
+    SetZookeerperStateTarget:
+        if ~UpdateTargetOwnership then
+            UpdateTargetOwnership := TRUE;    
+            with sessions \in TargetSessions \ {self} do
+                    await ServerState[sessions] = PrepareForMigration
+            end with;
+            MigrationServers := Append(MigrationServers, Target);
+            MigrationViewNumbers := Append(MigrationViewNumbers, TViewNumber[self]);    
+        end if;
     TakeOwnership:
         await TakeOwnershipRPC;
         \* Enter received records
@@ -207,19 +240,17 @@ fair process TargetServer = Target
         end if;
 end process;
 
-\* Model for client with an active session involved in migration
-(*process Clients = ClientSession
-    variable CViewNumbers = SetViewNumber, ServerNode = [s \in KVRanges |-> Source], KVRanges = {SourceKeys, KeysToMigrate, TargetKeys};
-  begin 
-    ServerInteraction:
-        while TRUE do
-            \* call proc that checks if ServerNode owns the 
-        end while;
-end process;*)
-
 \* TODO: Model timeouts and crashes - when third server is needed
 fair process CoordinatorProcess = Zookeeper
   begin
+    SetMigrationSourceState:
+        await UpdateSourceOwnership;
+        AllServerRanges[Head(MigrationServers)] := AllServerRanges[Head(MigrationServers)] \ MigrationRange;
+        AllServerViewNumbers[Head(MigrationServers)] := Head(MigrationViewNumbers);
+    SetMigrationTargetState:
+        await UpdateTaregtOwnership;
+        AllServerRanges[Head(Tail(MigrationServers))] := AllServerRanges[Head(Tail(MigrationServers))] \union MigrationRange;
+        AllServerViewNumbers[Head(Tail(MigrationServers))] := Head(Tail(MigrationViewNumbers));
     Init2PC:
         await Start2PC;
         SourcePrepare2PC := TRUE;
@@ -248,7 +279,19 @@ fair process CoordinatorProcess = Zookeeper
                 end if;
             end if;
         end either;
-        Decision2PC := TRUE;
+    CommitMigration:
+        Decision2PC := TRUE; 
+        UpdateZookeeperState();
+end process;
+
+\* Model for client with an active session involved in migration
+process Clients = ClientSession
+    variable KVRanges = {SourceKeys, KeysToMigrate, TargetKeys}, CViewNumbers = SetViewNumber(KVRanges), ServerNode = [s \in KVRanges |-> Source];
+  begin 
+    ServerInteraction:
+        while TRUE do
+            \* call proc that checks if ServerNode owns the 
+        end while;
 end process; 
 
 end algorithm; *)
@@ -719,5 +762,5 @@ Termination == <>(\A self \in ProcSet: pc[self] = "Done")
 \* END TRANSLATION
 =============================================================================
 \* Modification History
-\* Last modified Thu Feb 21 14:53:09 MST 2019 by aarushi
+\* Last modified Thu Feb 21 15:55:39 MST 2019 by aarushi
 \* Created Thu Jan 17 10:53:34 MST 2019 by aarushi
