@@ -19,6 +19,8 @@ variables
     StateInit = FALSE,
     ServerState = SetServerState(SourceSessions \union TargetSessions),
     TransferComplete = FALSE,
+    SourceAbort = FALSE,
+    TargetAbort = FALSE,
     \* Server state 
     SViewNumber = SetViewNumber(SourceSessions),
     TViewNumber = SetViewNumber(TargetSessions),
@@ -66,32 +68,33 @@ macro UpdateZookeeperState()
     end with;
 end macro;
 
-macro CheckZookeeper(kv, ServerNode, CViewNumber)
+macro CheckZookeeper(CurKV, ServerNode, CViewNumber)
   begin
-    if kv \in AllServerRanges[Source] then
-        ServerNode[kv] := Source;
-        CViewNumber[kv] := AllServerViewNumbers[Source];
-    else
-        ServerNode[kv] := Target;
-        CViewNumber[kv] := AllServerViewNumbers[Target];
+    if CurKV \in AllServerRanges[Source] then
+        ServerNode[CurKV] := Source;
+        CViewNumber[CurKV] := AllServerViewNumbers[Source];
+    elsif CurKV \in AllServerRanges[Target] then
+        ServerNode[CurKV] := Target;
+        CViewNumber[CurKV] := AllServerViewNumbers[Target];
     end if;
 end macro;
 
 \* Not at a per session level!!!
-procedure MakeRequest(Server, KV, ViewNumber, OpCompleted)
+procedure MakeRequest(Server, KVRange, ViewNumber, OpComp)
   begin
     CheckServerRange:
-        if KV \notin AllServerRanges[Server] \/ ViewNumber /= AllServerViewNumbers[Server] then
-            OpCompleted := FALSE;
+        if ViewNumber /= AllServerViewNumbers[Server] \/ KVRange \notin AllServerRanges[Server] then 
+            OpComp := FALSE;
         else
-            OpCompleted := TRUE;
+            OpComp := TRUE;
         end if;
+    ProcReturn:
+        return;
 end procedure;
 
 \* All local view numbers start at the last CPR checkpoint (0)
-\* Keep history of views from the last checkpoint? [key -> [view ranges, client sessions]]; This will be on a per thread basis?
 
-\* remove fair to check crashed states?
+\* remove fair to check crashed states
 fair process SourceProcess \in SourceSessions
     variable SKVRanges = {SourceKeys, KeysToMigrate}, SKVOwner = Ownership(SKVRanges, 0);
   begin
@@ -108,7 +111,7 @@ fair process SourceProcess \in SourceSessions
         SViewNumber[self] := SViewNumber[self] + 1;
         SKVOwner := Ownership(SKVRanges \ {KeysToMigrate}, SViewNumber[self]);
         if ~PrepForTransferRPC then
-            \* inform target about migrating ranges
+            \* Inform target about migrating ranges
             MigrationRange := KeysToMigrate;
             PrepForTransferRPC := TRUE;
         end if;
@@ -122,7 +125,6 @@ fair process SourceProcess \in SourceSessions
             MigrationViewNumbers := Append(MigrationViewNumbers, SViewNumber[self]);    
         end if;
     TransferOwnership:
-        \* TODO: Inform all clients
         ServerState[self] := TransferingOwnership;
     CompleteRequests:
         \* Wait for pending requests to complete
@@ -142,17 +144,28 @@ fair process SourceProcess \in SourceSessions
                 await ServerState[sessions] = WaitForPending
             end with;
             TransferComplete := TRUE;
-            \*UpdateZookeeper(Source, SViewNumber[self], SKVRanges);
         end if;
+    WaitForDecisionSource: 
+        await SourceAbort \/ Decision2PC;
+        if SourceAbort then
+            ServerState[self] := 2PCAbort;
+        else
+            if ServerVote[Source] /\ ServerVote[Target] then
+                ServerState[self] := 2PCCommit;
+            else 
+                ServerState[self] := 2PCAbort;
+            end if;
+        end if;
+    (*UpdateStateSource: \* In case of recovery
+        if ServerState[self] = 2PCAbort then
+            SKVRanges := SKVRanges \union {KeysToMigrate};*)
 end process;
 
 fair process SourceServer = Source
-    variable SourceDecision = FALSE;
   begin
     \* Checkpointing
     CompleteMigration:
         await TransferComplete;
-        \*UpdateZookeeper(Source, SViewNumber[self], SKVRanges);
         with s \in SourceSessions do
             ServerState[s] := WaitForCheckpoint
         end with;
@@ -160,7 +173,7 @@ fair process SourceServer = Source
     StartCommit:
         await ACKTransferCompleteRPC;
         Start2PC := TRUE;
-    \* 2PC - need to check if other server has voted?
+    \* 2PC
     WaitForPrepare:
         await SourcePrepare2PC;
         either 
@@ -170,24 +183,8 @@ fair process SourceServer = Source
             end with;
         or
             SourceACK := FALSE;
-            with s \in SourceSessions do 
-                ServerState[s] := 2PCAbort
-            end with;
-            SourceDecision := TRUE;
+            SourceAbort := TRUE;
         end either;
-    WaitForDecisionSource:
-        if ~SourceDecision then
-            await Decision2PC; 
-            if ServerVote[Target] then 
-                with s \in SourceSessions do
-                    ServerState[s] := 2PCCommit
-                end with;
-            else 
-                with s \in SourceSessions do
-                    ServerState[s] := 2PCAbort
-                end with;
-            end if;
-        end if;
 end process;
 
 fair process TargetProcess \in TargetSessions
@@ -198,8 +195,10 @@ fair process TargetProcess \in TargetSessions
         \* TODO: Buffer requests for migrating ranges
         ServerState[self] := PrepareForMigration;
         TKVRanges := TKVRanges \union {MigrationRange};
+        TViewNumber[self] := TViewNumber[self] + 1;
         TKVOwner := Ownership(TKVRanges, TViewNumber[self]);
     SetZookeerperStateTarget:
+        await UpdateSourceOwnership;
         if ~UpdateTargetOwnership then
             UpdateTargetOwnership := TRUE;    
             with sessions \in TargetSessions \ {self} do
@@ -210,14 +209,21 @@ fair process TargetProcess \in TargetSessions
         end if;
     TakeOwnership:
         await TakeOwnershipRPC;
-        \* Enter received records
         ServerState[self] := ReceivingData;
-        \*UpdateZookeeper(Target, TViewNumber[self], TKVRanges);
-        \* TODO: Start executing requests
+    WaitForDecisionTarget: \* In case of recovery
+        await TargetAbort \/ Decision2PC;
+        if TargetAbort then
+            ServerState[self] := 2PCAbort;
+        else
+            if ServerVote[Source] /\ ServerVote[Target] then
+                ServerState[self] := 2PCCommit;
+            else 
+                ServerState[self] := 2PCAbort;
+            end if;
+        end if;
 end process;
 
 fair process TargetServer = Target
-    variable TargetDecision = FALSE;
   begin
     \* Checkpointing
     StartCheckpointing:
@@ -236,27 +242,10 @@ fair process TargetServer = Target
             end with;
         or
             TargetACK := FALSE;
-            with s \in TargetSessions do
-                ServerState[s] := 2PCAbort
-            end with;
-            TargetDecision := TRUE;
+            TargetAbort := TRUE;
         end either;
-    WaitForDecisionTarget:
-        if ~TargetDecision then
-            await Decision2PC;
-            if ServerVote[Source] then 
-                with s \in TargetSessions do
-                    ServerState[s] := 2PCCommit
-                end with;
-            else
-                with s \in TargetSessions do
-                    ServerState[s] := 2PCAbort
-                end with;
-            end if;
-        end if;
 end process;
 
-\* TODO: Model timeouts and crashes - when third server is needed
 fair process CoordinatorProcess = Zookeeper
   begin
     InitState:
@@ -278,7 +267,6 @@ fair process CoordinatorProcess = Zookeeper
         await SourceACK \in BOOLEAN \/ TargetACK \in BOOLEAN;
         either 
             await SourceACK \in BOOLEAN /\ TargetACK \in BOOLEAN;
-            \* one of the servers voted false - is this needed?
             if ~SourceACK \/ ~TargetACK then
                 ServerVote[Source] := FALSE || ServerVote[Target] := FALSE;
             elsif SourceACK /\ TargetACK then
@@ -290,7 +278,6 @@ fair process CoordinatorProcess = Zookeeper
                 ServerVote[Source] := FALSE || ServerVote[Target] := FALSE;
             else
                 await SourceACK \in BOOLEAN /\ TargetACK \in BOOLEAN;
-                \* one of the servers voted false - is this needed?
                 if ~SourceACK \/ ~TargetACK then
                     ServerVote[Source] := FALSE || ServerVote[Target] := FALSE;
                 elsif SourceACK /\ TargetACK then
@@ -303,7 +290,6 @@ fair process CoordinatorProcess = Zookeeper
         UpdateZookeeperState();
 end process;
 
-\* Model for client with an active session involved in migration
 fair process Clients = "Client"
     variable KVRanges = {SourceKeys, KeysToMigrate, TargetKeys}, CViewNumbers = SetViewNumber(KVRanges), ServerNode = [s \in KVRanges |-> Source], OpCompleted = FALSE, CurKV = NULL;
   begin 
@@ -326,33 +312,32 @@ end process;
 end algorithm; *)
 
 \* BEGIN TRANSLATION
-\* Process variable OpCompleted of process Clients at line 308 col 148 changed to OpCompleted_
 CONSTANT defaultInitValue
-VARIABLES StateInit, ServerState, TransferComplete, SViewNumber, TViewNumber, 
-          PrepForTransferRPC, UpdateSourceOwnership, UpdateTargetOwnership, 
-          TakeOwnershipRPC, TransferCompleteRPC, ACKTransferCompleteRPC, 
-          SourceACK, TargetACK, AllServerRanges, AllServerViewNumbers, 
-          MigrationServers, MigrationViewNumbers, MigrationRange, ServerVote, 
-          Start2PC, SourcePrepare2PC, TargetPrepare2PC, Decision2PC, pc, 
-          stack
+VARIABLES StateInit, ServerState, TransferComplete, SourceAbort, TargetAbort, 
+          SViewNumber, TViewNumber, PrepForTransferRPC, UpdateSourceOwnership, 
+          UpdateTargetOwnership, TakeOwnershipRPC, TransferCompleteRPC, 
+          ACKTransferCompleteRPC, SourceACK, TargetACK, AllServerRanges, 
+          AllServerViewNumbers, MigrationServers, MigrationViewNumbers, 
+          MigrationRange, ServerVote, Start2PC, SourcePrepare2PC, 
+          TargetPrepare2PC, Decision2PC, pc, stack
 
 (* define statement *)
 MigrationSuccess == (\E s \in SourceSessions: ServerState[s] = 2PCCommit /\ \E t \in TargetSessions: ServerState[t] = 2PCCommit) ~> <>[](ServerVote[Source] /\ ServerVote[Target])
 MigrationFailure == (\E s \in SourceSessions: ServerState[s] = 2PCAbort /\ \E t \in TargetSessions: ServerState[t] = 2PCAbort) ~> <>[] (~ServerVote[Source] /\ ~ServerVote[Target])
 
-VARIABLES Server, KV, ViewNumber, OpCompleted, SKVRanges, SKVOwner, 
-          SourceDecision, TKVRanges, TKVOwner, TargetDecision, KVRanges, 
-          CViewNumbers, ServerNode, OpCompleted_, CurKV
+VARIABLES Server, KVRange, ViewNumber, OpComp, SKVRanges, SKVOwner, TKVRanges, 
+          TKVOwner, KVRanges, CViewNumbers, ServerNode, OpCompleted, CurKV
 
-vars == << StateInit, ServerState, TransferComplete, SViewNumber, TViewNumber, 
-           PrepForTransferRPC, UpdateSourceOwnership, UpdateTargetOwnership, 
-           TakeOwnershipRPC, TransferCompleteRPC, ACKTransferCompleteRPC, 
-           SourceACK, TargetACK, AllServerRanges, AllServerViewNumbers, 
-           MigrationServers, MigrationViewNumbers, MigrationRange, ServerVote, 
-           Start2PC, SourcePrepare2PC, TargetPrepare2PC, Decision2PC, pc, 
-           stack, Server, KV, ViewNumber, OpCompleted, SKVRanges, SKVOwner, 
-           SourceDecision, TKVRanges, TKVOwner, TargetDecision, KVRanges, 
-           CViewNumbers, ServerNode, OpCompleted_, CurKV >>
+vars == << StateInit, ServerState, TransferComplete, SourceAbort, TargetAbort, 
+           SViewNumber, TViewNumber, PrepForTransferRPC, 
+           UpdateSourceOwnership, UpdateTargetOwnership, TakeOwnershipRPC, 
+           TransferCompleteRPC, ACKTransferCompleteRPC, SourceACK, TargetACK, 
+           AllServerRanges, AllServerViewNumbers, MigrationServers, 
+           MigrationViewNumbers, MigrationRange, ServerVote, Start2PC, 
+           SourcePrepare2PC, TargetPrepare2PC, Decision2PC, pc, stack, Server, 
+           KVRange, ViewNumber, OpComp, SKVRanges, SKVOwner, TKVRanges, 
+           TKVOwner, KVRanges, CViewNumbers, ServerNode, OpCompleted, CurKV
+        >>
 
 ProcSet == (SourceSessions) \cup {Source} \cup (TargetSessions) \cup {Target} \cup {Zookeeper} \cup {"Client"}
 
@@ -360,6 +345,8 @@ Init == (* Global variables *)
         /\ StateInit = FALSE
         /\ ServerState = SetServerState(SourceSessions \union TargetSessions)
         /\ TransferComplete = FALSE
+        /\ SourceAbort = FALSE
+        /\ TargetAbort = FALSE
         /\ SViewNumber = SetViewNumber(SourceSessions)
         /\ TViewNumber = SetViewNumber(TargetSessions)
         /\ PrepForTransferRPC = FALSE
@@ -382,24 +369,20 @@ Init == (* Global variables *)
         /\ Decision2PC = FALSE
         (* Procedure MakeRequest *)
         /\ Server = [ self \in ProcSet |-> defaultInitValue]
-        /\ KV = [ self \in ProcSet |-> defaultInitValue]
+        /\ KVRange = [ self \in ProcSet |-> defaultInitValue]
         /\ ViewNumber = [ self \in ProcSet |-> defaultInitValue]
-        /\ OpCompleted = [ self \in ProcSet |-> defaultInitValue]
+        /\ OpComp = [ self \in ProcSet |-> defaultInitValue]
         (* Process SourceProcess *)
         /\ SKVRanges = [self \in SourceSessions |-> {SourceKeys, KeysToMigrate}]
         /\ SKVOwner = [self \in SourceSessions |-> Ownership(SKVRanges[self], 0)]
-        (* Process SourceServer *)
-        /\ SourceDecision = FALSE
         (* Process TargetProcess *)
         /\ TKVRanges = [self \in TargetSessions |-> {TargetKeys}]
         /\ TKVOwner = [self \in TargetSessions |-> Ownership(TKVRanges[self], 0)]
-        (* Process TargetServer *)
-        /\ TargetDecision = FALSE
         (* Process Clients *)
         /\ KVRanges = {SourceKeys, KeysToMigrate, TargetKeys}
         /\ CViewNumbers = SetViewNumber(KVRanges)
         /\ ServerNode = [s \in KVRanges |-> Source]
-        /\ OpCompleted_ = FALSE
+        /\ OpCompleted = FALSE
         /\ CurKV = NULL
         /\ stack = [self \in ProcSet |-> << >>]
         /\ pc = [self \in ProcSet |-> CASE self \in SourceSessions -> "InitMigrationSource"
@@ -410,12 +393,13 @@ Init == (* Global variables *)
                                         [] self = "Client" -> "InitClient"]
 
 CheckServerRange(self) == /\ pc[self] = "CheckServerRange"
-                          /\ IF KV[self] \notin AllServerRanges[Server[self]] \/ ViewNumber[self] /= AllServerViewNumbers[Server[self]]
-                                THEN /\ OpCompleted' = [OpCompleted EXCEPT ![self] = FALSE]
-                                ELSE /\ OpCompleted' = [OpCompleted EXCEPT ![self] = TRUE]
-                          /\ pc' = [pc EXCEPT ![self] = "Error"]
+                          /\ IF ViewNumber[self] /= AllServerViewNumbers[Server[self]] \/ KVRange[self] \notin AllServerRanges[Server[self]]
+                                THEN /\ OpComp' = [OpComp EXCEPT ![self] = FALSE]
+                                ELSE /\ OpComp' = [OpComp EXCEPT ![self] = TRUE]
+                          /\ pc' = [pc EXCEPT ![self] = "ProcReturn"]
                           /\ UNCHANGED << StateInit, ServerState, 
-                                          TransferComplete, SViewNumber, 
+                                          TransferComplete, SourceAbort, 
+                                          TargetAbort, SViewNumber, 
                                           TViewNumber, PrepForTransferRPC, 
                                           UpdateSourceOwnership, 
                                           UpdateTargetOwnership, 
@@ -428,19 +412,42 @@ CheckServerRange(self) == /\ pc[self] = "CheckServerRange"
                                           MigrationViewNumbers, MigrationRange, 
                                           ServerVote, Start2PC, 
                                           SourcePrepare2PC, TargetPrepare2PC, 
-                                          Decision2PC, stack, Server, KV, 
+                                          Decision2PC, stack, Server, KVRange, 
                                           ViewNumber, SKVRanges, SKVOwner, 
-                                          SourceDecision, TKVRanges, TKVOwner, 
-                                          TargetDecision, KVRanges, 
+                                          TKVRanges, TKVOwner, KVRanges, 
                                           CViewNumbers, ServerNode, 
-                                          OpCompleted_, CurKV >>
+                                          OpCompleted, CurKV >>
 
-MakeRequest(self) == CheckServerRange(self)
+ProcReturn(self) == /\ pc[self] = "ProcReturn"
+                    /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
+                    /\ Server' = [Server EXCEPT ![self] = Head(stack[self]).Server]
+                    /\ KVRange' = [KVRange EXCEPT ![self] = Head(stack[self]).KVRange]
+                    /\ ViewNumber' = [ViewNumber EXCEPT ![self] = Head(stack[self]).ViewNumber]
+                    /\ OpComp' = [OpComp EXCEPT ![self] = Head(stack[self]).OpComp]
+                    /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
+                    /\ UNCHANGED << StateInit, ServerState, TransferComplete, 
+                                    SourceAbort, TargetAbort, SViewNumber, 
+                                    TViewNumber, PrepForTransferRPC, 
+                                    UpdateSourceOwnership, 
+                                    UpdateTargetOwnership, TakeOwnershipRPC, 
+                                    TransferCompleteRPC, 
+                                    ACKTransferCompleteRPC, SourceACK, 
+                                    TargetACK, AllServerRanges, 
+                                    AllServerViewNumbers, MigrationServers, 
+                                    MigrationViewNumbers, MigrationRange, 
+                                    ServerVote, Start2PC, SourcePrepare2PC, 
+                                    TargetPrepare2PC, Decision2PC, SKVRanges, 
+                                    SKVOwner, TKVRanges, TKVOwner, KVRanges, 
+                                    CViewNumbers, ServerNode, OpCompleted, 
+                                    CurKV >>
+
+MakeRequest(self) == CheckServerRange(self) \/ ProcReturn(self)
 
 InitMigrationSource(self) == /\ pc[self] = "InitMigrationSource"
                              /\ ServerState' = [ServerState EXCEPT ![self] = PrepareToSample]
                              /\ pc' = [pc EXCEPT ![self] = "SampleRecords"]
                              /\ UNCHANGED << StateInit, TransferComplete, 
+                                             SourceAbort, TargetAbort, 
                                              SViewNumber, TViewNumber, 
                                              PrepForTransferRPC, 
                                              UpdateSourceOwnership, 
@@ -455,19 +462,18 @@ InitMigrationSource(self) == /\ pc[self] = "InitMigrationSource"
                                              MigrationRange, ServerVote, 
                                              Start2PC, SourcePrepare2PC, 
                                              TargetPrepare2PC, Decision2PC, 
-                                             stack, Server, KV, ViewNumber, 
-                                             OpCompleted, SKVRanges, SKVOwner, 
-                                             SourceDecision, TKVRanges, 
-                                             TKVOwner, TargetDecision, 
+                                             stack, Server, KVRange, 
+                                             ViewNumber, OpComp, SKVRanges, 
+                                             SKVOwner, TKVRanges, TKVOwner, 
                                              KVRanges, CViewNumbers, 
-                                             ServerNode, OpCompleted_, CurKV >>
+                                             ServerNode, OpCompleted, CurKV >>
 
 SampleRecords(self) == /\ pc[self] = "SampleRecords"
                        /\ ServerState' = [ServerState EXCEPT ![self] = Sampling]
                        /\ pc' = [pc EXCEPT ![self] = "ViewChange"]
                        /\ UNCHANGED << StateInit, TransferComplete, 
-                                       SViewNumber, TViewNumber, 
-                                       PrepForTransferRPC, 
+                                       SourceAbort, TargetAbort, SViewNumber, 
+                                       TViewNumber, PrepForTransferRPC, 
                                        UpdateSourceOwnership, 
                                        UpdateTargetOwnership, TakeOwnershipRPC, 
                                        TransferCompleteRPC, 
@@ -477,11 +483,10 @@ SampleRecords(self) == /\ pc[self] = "SampleRecords"
                                        MigrationViewNumbers, MigrationRange, 
                                        ServerVote, Start2PC, SourcePrepare2PC, 
                                        TargetPrepare2PC, Decision2PC, stack, 
-                                       Server, KV, ViewNumber, OpCompleted, 
-                                       SKVRanges, SKVOwner, SourceDecision, 
-                                       TKVRanges, TKVOwner, TargetDecision, 
-                                       KVRanges, CViewNumbers, ServerNode, 
-                                       OpCompleted_, CurKV >>
+                                       Server, KVRange, ViewNumber, OpComp, 
+                                       SKVRanges, SKVOwner, TKVRanges, 
+                                       TKVOwner, KVRanges, CViewNumbers, 
+                                       ServerNode, OpCompleted, CurKV >>
 
 ViewChange(self) == /\ pc[self] = "ViewChange"
                     /\ ServerState' = [ServerState EXCEPT ![self] = PrepareForTransfer]
@@ -494,7 +499,8 @@ ViewChange(self) == /\ pc[self] = "ViewChange"
                                /\ UNCHANGED << PrepForTransferRPC, 
                                                MigrationRange >>
                     /\ pc' = [pc EXCEPT ![self] = "SetZookeerperStateSource"]
-                    /\ UNCHANGED << StateInit, TransferComplete, TViewNumber, 
+                    /\ UNCHANGED << StateInit, TransferComplete, SourceAbort, 
+                                    TargetAbort, TViewNumber, 
                                     UpdateSourceOwnership, 
                                     UpdateTargetOwnership, TakeOwnershipRPC, 
                                     TransferCompleteRPC, 
@@ -503,11 +509,10 @@ ViewChange(self) == /\ pc[self] = "ViewChange"
                                     AllServerViewNumbers, MigrationServers, 
                                     MigrationViewNumbers, ServerVote, Start2PC, 
                                     SourcePrepare2PC, TargetPrepare2PC, 
-                                    Decision2PC, stack, Server, KV, ViewNumber, 
-                                    OpCompleted, SKVRanges, SourceDecision, 
-                                    TKVRanges, TKVOwner, TargetDecision, 
-                                    KVRanges, CViewNumbers, ServerNode, 
-                                    OpCompleted_, CurKV >>
+                                    Decision2PC, stack, Server, KVRange, 
+                                    ViewNumber, OpComp, SKVRanges, TKVRanges, 
+                                    TKVOwner, KVRanges, CViewNumbers, 
+                                    ServerNode, OpCompleted, CurKV >>
 
 SetZookeerperStateSource(self) == /\ pc[self] = "SetZookeerperStateSource"
                                   /\ IF ~UpdateSourceOwnership
@@ -523,6 +528,7 @@ SetZookeerperStateSource(self) == /\ pc[self] = "SetZookeerperStateSource"
                                   /\ pc' = [pc EXCEPT ![self] = "TransferOwnership"]
                                   /\ UNCHANGED << StateInit, ServerState, 
                                                   TransferComplete, 
+                                                  SourceAbort, TargetAbort, 
                                                   SViewNumber, TViewNumber, 
                                                   PrepForTransferRPC, 
                                                   UpdateTargetOwnership, 
@@ -536,18 +542,18 @@ SetZookeerperStateSource(self) == /\ pc[self] = "SetZookeerperStateSource"
                                                   Start2PC, SourcePrepare2PC, 
                                                   TargetPrepare2PC, 
                                                   Decision2PC, stack, Server, 
-                                                  KV, ViewNumber, OpCompleted, 
+                                                  KVRange, ViewNumber, OpComp, 
                                                   SKVRanges, SKVOwner, 
-                                                  SourceDecision, TKVRanges, 
-                                                  TKVOwner, TargetDecision, 
+                                                  TKVRanges, TKVOwner, 
                                                   KVRanges, CViewNumbers, 
-                                                  ServerNode, OpCompleted_, 
+                                                  ServerNode, OpCompleted, 
                                                   CurKV >>
 
 TransferOwnership(self) == /\ pc[self] = "TransferOwnership"
                            /\ ServerState' = [ServerState EXCEPT ![self] = TransferingOwnership]
                            /\ pc' = [pc EXCEPT ![self] = "CompleteRequests"]
                            /\ UNCHANGED << StateInit, TransferComplete, 
+                                           SourceAbort, TargetAbort, 
                                            SViewNumber, TViewNumber, 
                                            PrepForTransferRPC, 
                                            UpdateSourceOwnership, 
@@ -562,12 +568,11 @@ TransferOwnership(self) == /\ pc[self] = "TransferOwnership"
                                            MigrationRange, ServerVote, 
                                            Start2PC, SourcePrepare2PC, 
                                            TargetPrepare2PC, Decision2PC, 
-                                           stack, Server, KV, ViewNumber, 
-                                           OpCompleted, SKVRanges, SKVOwner, 
-                                           SourceDecision, TKVRanges, TKVOwner, 
-                                           TargetDecision, KVRanges, 
+                                           stack, Server, KVRange, ViewNumber, 
+                                           OpComp, SKVRanges, SKVOwner, 
+                                           TKVRanges, TKVOwner, KVRanges, 
                                            CViewNumbers, ServerNode, 
-                                           OpCompleted_, CurKV >>
+                                           OpCompleted, CurKV >>
 
 CompleteRequests(self) == /\ pc[self] = "CompleteRequests"
                           /\ ServerState' = [ServerState EXCEPT ![self] = WaitForPending]
@@ -579,6 +584,7 @@ CompleteRequests(self) == /\ pc[self] = "CompleteRequests"
                                      /\ UNCHANGED TakeOwnershipRPC
                           /\ pc' = [pc EXCEPT ![self] = "MoveData"]
                           /\ UNCHANGED << StateInit, TransferComplete, 
+                                          SourceAbort, TargetAbort, 
                                           SViewNumber, TViewNumber, 
                                           PrepForTransferRPC, 
                                           UpdateSourceOwnership, 
@@ -591,12 +597,11 @@ CompleteRequests(self) == /\ pc[self] = "CompleteRequests"
                                           MigrationViewNumbers, MigrationRange, 
                                           ServerVote, Start2PC, 
                                           SourcePrepare2PC, TargetPrepare2PC, 
-                                          Decision2PC, stack, Server, KV, 
-                                          ViewNumber, OpCompleted, SKVRanges, 
-                                          SKVOwner, SourceDecision, TKVRanges, 
-                                          TKVOwner, TargetDecision, KVRanges, 
-                                          CViewNumbers, ServerNode, 
-                                          OpCompleted_, CurKV >>
+                                          Decision2PC, stack, Server, KVRange, 
+                                          ViewNumber, OpComp, SKVRanges, 
+                                          SKVOwner, TKVRanges, TKVOwner, 
+                                          KVRanges, CViewNumbers, ServerNode, 
+                                          OpCompleted, CurKV >>
 
 MoveData(self) == /\ pc[self] = "MoveData"
                   /\ SKVRanges' = [SKVRanges EXCEPT ![self] = SKVRanges[self] \ {KeysToMigrate}]
@@ -607,26 +612,58 @@ MoveData(self) == /\ pc[self] = "MoveData"
                              /\ TransferComplete' = TRUE
                         ELSE /\ TRUE
                              /\ UNCHANGED TransferComplete
-                  /\ pc' = [pc EXCEPT ![self] = "Done"]
-                  /\ UNCHANGED << StateInit, SViewNumber, TViewNumber, 
-                                  PrepForTransferRPC, UpdateSourceOwnership, 
-                                  UpdateTargetOwnership, TakeOwnershipRPC, 
-                                  TransferCompleteRPC, ACKTransferCompleteRPC, 
-                                  SourceACK, TargetACK, AllServerRanges, 
-                                  AllServerViewNumbers, MigrationServers, 
-                                  MigrationViewNumbers, MigrationRange, 
-                                  ServerVote, Start2PC, SourcePrepare2PC, 
-                                  TargetPrepare2PC, Decision2PC, stack, Server, 
-                                  KV, ViewNumber, OpCompleted, SKVOwner, 
-                                  SourceDecision, TKVRanges, TKVOwner, 
-                                  TargetDecision, KVRanges, CViewNumbers, 
-                                  ServerNode, OpCompleted_, CurKV >>
+                  /\ pc' = [pc EXCEPT ![self] = "WaitForDecisionSource"]
+                  /\ UNCHANGED << StateInit, SourceAbort, TargetAbort, 
+                                  SViewNumber, TViewNumber, PrepForTransferRPC, 
+                                  UpdateSourceOwnership, UpdateTargetOwnership, 
+                                  TakeOwnershipRPC, TransferCompleteRPC, 
+                                  ACKTransferCompleteRPC, SourceACK, TargetACK, 
+                                  AllServerRanges, AllServerViewNumbers, 
+                                  MigrationServers, MigrationViewNumbers, 
+                                  MigrationRange, ServerVote, Start2PC, 
+                                  SourcePrepare2PC, TargetPrepare2PC, 
+                                  Decision2PC, stack, Server, KVRange, 
+                                  ViewNumber, OpComp, SKVOwner, TKVRanges, 
+                                  TKVOwner, KVRanges, CViewNumbers, ServerNode, 
+                                  OpCompleted, CurKV >>
+
+WaitForDecisionSource(self) == /\ pc[self] = "WaitForDecisionSource"
+                               /\ SourceAbort \/ Decision2PC
+                               /\ IF SourceAbort
+                                     THEN /\ ServerState' = [ServerState EXCEPT ![self] = 2PCAbort]
+                                     ELSE /\ IF ServerVote[Source] /\ ServerVote[Target]
+                                                THEN /\ ServerState' = [ServerState EXCEPT ![self] = 2PCCommit]
+                                                ELSE /\ ServerState' = [ServerState EXCEPT ![self] = 2PCAbort]
+                               /\ pc' = [pc EXCEPT ![self] = "Done"]
+                               /\ UNCHANGED << StateInit, TransferComplete, 
+                                               SourceAbort, TargetAbort, 
+                                               SViewNumber, TViewNumber, 
+                                               PrepForTransferRPC, 
+                                               UpdateSourceOwnership, 
+                                               UpdateTargetOwnership, 
+                                               TakeOwnershipRPC, 
+                                               TransferCompleteRPC, 
+                                               ACKTransferCompleteRPC, 
+                                               SourceACK, TargetACK, 
+                                               AllServerRanges, 
+                                               AllServerViewNumbers, 
+                                               MigrationServers, 
+                                               MigrationViewNumbers, 
+                                               MigrationRange, ServerVote, 
+                                               Start2PC, SourcePrepare2PC, 
+                                               TargetPrepare2PC, Decision2PC, 
+                                               stack, Server, KVRange, 
+                                               ViewNumber, OpComp, SKVRanges, 
+                                               SKVOwner, TKVRanges, TKVOwner, 
+                                               KVRanges, CViewNumbers, 
+                                               ServerNode, OpCompleted, CurKV >>
 
 SourceProcess(self) == InitMigrationSource(self) \/ SampleRecords(self)
                           \/ ViewChange(self)
                           \/ SetZookeerperStateSource(self)
                           \/ TransferOwnership(self)
                           \/ CompleteRequests(self) \/ MoveData(self)
+                          \/ WaitForDecisionSource(self)
 
 CompleteMigration == /\ pc[Source] = "CompleteMigration"
                      /\ TransferComplete
@@ -634,9 +671,9 @@ CompleteMigration == /\ pc[Source] = "CompleteMigration"
                           ServerState' = [ServerState EXCEPT ![s] = WaitForCheckpoint]
                      /\ TransferCompleteRPC' = TRUE
                      /\ pc' = [pc EXCEPT ![Source] = "StartCommit"]
-                     /\ UNCHANGED << StateInit, TransferComplete, SViewNumber, 
-                                     TViewNumber, PrepForTransferRPC, 
-                                     UpdateSourceOwnership, 
+                     /\ UNCHANGED << StateInit, TransferComplete, SourceAbort, 
+                                     TargetAbort, SViewNumber, TViewNumber, 
+                                     PrepForTransferRPC, UpdateSourceOwnership, 
                                      UpdateTargetOwnership, TakeOwnershipRPC, 
                                      ACKTransferCompleteRPC, SourceACK, 
                                      TargetACK, AllServerRanges, 
@@ -644,18 +681,18 @@ CompleteMigration == /\ pc[Source] = "CompleteMigration"
                                      MigrationViewNumbers, MigrationRange, 
                                      ServerVote, Start2PC, SourcePrepare2PC, 
                                      TargetPrepare2PC, Decision2PC, stack, 
-                                     Server, KV, ViewNumber, OpCompleted, 
-                                     SKVRanges, SKVOwner, SourceDecision, 
-                                     TKVRanges, TKVOwner, TargetDecision, 
+                                     Server, KVRange, ViewNumber, OpComp, 
+                                     SKVRanges, SKVOwner, TKVRanges, TKVOwner, 
                                      KVRanges, CViewNumbers, ServerNode, 
-                                     OpCompleted_, CurKV >>
+                                     OpCompleted, CurKV >>
 
 StartCommit == /\ pc[Source] = "StartCommit"
                /\ ACKTransferCompleteRPC
                /\ Start2PC' = TRUE
                /\ pc' = [pc EXCEPT ![Source] = "WaitForPrepare"]
                /\ UNCHANGED << StateInit, ServerState, TransferComplete, 
-                               SViewNumber, TViewNumber, PrepForTransferRPC, 
+                               SourceAbort, TargetAbort, SViewNumber, 
+                               TViewNumber, PrepForTransferRPC, 
                                UpdateSourceOwnership, UpdateTargetOwnership, 
                                TakeOwnershipRPC, TransferCompleteRPC, 
                                ACKTransferCompleteRPC, SourceACK, TargetACK, 
@@ -663,24 +700,22 @@ StartCommit == /\ pc[Source] = "StartCommit"
                                MigrationServers, MigrationViewNumbers, 
                                MigrationRange, ServerVote, SourcePrepare2PC, 
                                TargetPrepare2PC, Decision2PC, stack, Server, 
-                               KV, ViewNumber, OpCompleted, SKVRanges, 
-                               SKVOwner, SourceDecision, TKVRanges, TKVOwner, 
-                               TargetDecision, KVRanges, CViewNumbers, 
-                               ServerNode, OpCompleted_, CurKV >>
+                               KVRange, ViewNumber, OpComp, SKVRanges, 
+                               SKVOwner, TKVRanges, TKVOwner, KVRanges, 
+                               CViewNumbers, ServerNode, OpCompleted, CurKV >>
 
 WaitForPrepare == /\ pc[Source] = "WaitForPrepare"
                   /\ SourcePrepare2PC
                   /\ \/ /\ SourceACK' = TRUE
                         /\ \E s \in SourceSessions:
                              ServerState' = [ServerState EXCEPT ![s] = 2PCPrepare]
-                        /\ UNCHANGED SourceDecision
+                        /\ UNCHANGED SourceAbort
                      \/ /\ SourceACK' = FALSE
-                        /\ \E s \in SourceSessions:
-                             ServerState' = [ServerState EXCEPT ![s] = 2PCAbort]
-                        /\ SourceDecision' = TRUE
-                  /\ pc' = [pc EXCEPT ![Source] = "WaitForDecisionSource"]
-                  /\ UNCHANGED << StateInit, TransferComplete, SViewNumber, 
-                                  TViewNumber, PrepForTransferRPC, 
+                        /\ SourceAbort' = TRUE
+                        /\ UNCHANGED ServerState
+                  /\ pc' = [pc EXCEPT ![Source] = "Done"]
+                  /\ UNCHANGED << StateInit, TransferComplete, TargetAbort, 
+                                  SViewNumber, TViewNumber, PrepForTransferRPC, 
                                   UpdateSourceOwnership, UpdateTargetOwnership, 
                                   TakeOwnershipRPC, TransferCompleteRPC, 
                                   ACKTransferCompleteRPC, TargetACK, 
@@ -688,55 +723,23 @@ WaitForPrepare == /\ pc[Source] = "WaitForPrepare"
                                   MigrationServers, MigrationViewNumbers, 
                                   MigrationRange, ServerVote, Start2PC, 
                                   SourcePrepare2PC, TargetPrepare2PC, 
-                                  Decision2PC, stack, Server, KV, ViewNumber, 
-                                  OpCompleted, SKVRanges, SKVOwner, TKVRanges, 
-                                  TKVOwner, TargetDecision, KVRanges, 
-                                  CViewNumbers, ServerNode, OpCompleted_, 
-                                  CurKV >>
-
-WaitForDecisionSource == /\ pc[Source] = "WaitForDecisionSource"
-                         /\ IF ~SourceDecision
-                               THEN /\ Decision2PC
-                                    /\ IF ServerVote[Target]
-                                          THEN /\ \E s \in SourceSessions:
-                                                    ServerState' = [ServerState EXCEPT ![s] = 2PCCommit]
-                                          ELSE /\ \E s \in SourceSessions:
-                                                    ServerState' = [ServerState EXCEPT ![s] = 2PCAbort]
-                               ELSE /\ TRUE
-                                    /\ UNCHANGED ServerState
-                         /\ pc' = [pc EXCEPT ![Source] = "Done"]
-                         /\ UNCHANGED << StateInit, TransferComplete, 
-                                         SViewNumber, TViewNumber, 
-                                         PrepForTransferRPC, 
-                                         UpdateSourceOwnership, 
-                                         UpdateTargetOwnership, 
-                                         TakeOwnershipRPC, TransferCompleteRPC, 
-                                         ACKTransferCompleteRPC, SourceACK, 
-                                         TargetACK, AllServerRanges, 
-                                         AllServerViewNumbers, 
-                                         MigrationServers, 
-                                         MigrationViewNumbers, MigrationRange, 
-                                         ServerVote, Start2PC, 
-                                         SourcePrepare2PC, TargetPrepare2PC, 
-                                         Decision2PC, stack, Server, KV, 
-                                         ViewNumber, OpCompleted, SKVRanges, 
-                                         SKVOwner, SourceDecision, TKVRanges, 
-                                         TKVOwner, TargetDecision, KVRanges, 
-                                         CViewNumbers, ServerNode, 
-                                         OpCompleted_, CurKV >>
+                                  Decision2PC, stack, Server, KVRange, 
+                                  ViewNumber, OpComp, SKVRanges, SKVOwner, 
+                                  TKVRanges, TKVOwner, KVRanges, CViewNumbers, 
+                                  ServerNode, OpCompleted, CurKV >>
 
 SourceServer == CompleteMigration \/ StartCommit \/ WaitForPrepare
-                   \/ WaitForDecisionSource
 
 InitMigrationTarget(self) == /\ pc[self] = "InitMigrationTarget"
                              /\ PrepForTransferRPC
                              /\ ServerState' = [ServerState EXCEPT ![self] = PrepareForMigration]
                              /\ TKVRanges' = [TKVRanges EXCEPT ![self] = TKVRanges[self] \union {MigrationRange}]
-                             /\ TKVOwner' = [TKVOwner EXCEPT ![self] = Ownership(TKVRanges'[self], TViewNumber[self])]
+                             /\ TViewNumber' = [TViewNumber EXCEPT ![self] = TViewNumber[self] + 1]
+                             /\ TKVOwner' = [TKVOwner EXCEPT ![self] = Ownership(TKVRanges'[self], TViewNumber'[self])]
                              /\ pc' = [pc EXCEPT ![self] = "SetZookeerperStateTarget"]
                              /\ UNCHANGED << StateInit, TransferComplete, 
-                                             SViewNumber, TViewNumber, 
-                                             PrepForTransferRPC, 
+                                             SourceAbort, TargetAbort, 
+                                             SViewNumber, PrepForTransferRPC, 
                                              UpdateSourceOwnership, 
                                              UpdateTargetOwnership, 
                                              TakeOwnershipRPC, 
@@ -749,13 +752,13 @@ InitMigrationTarget(self) == /\ pc[self] = "InitMigrationTarget"
                                              MigrationRange, ServerVote, 
                                              Start2PC, SourcePrepare2PC, 
                                              TargetPrepare2PC, Decision2PC, 
-                                             stack, Server, KV, ViewNumber, 
-                                             OpCompleted, SKVRanges, SKVOwner, 
-                                             SourceDecision, TargetDecision, 
-                                             KVRanges, CViewNumbers, 
-                                             ServerNode, OpCompleted_, CurKV >>
+                                             stack, Server, KVRange, 
+                                             ViewNumber, OpComp, SKVRanges, 
+                                             SKVOwner, KVRanges, CViewNumbers, 
+                                             ServerNode, OpCompleted, CurKV >>
 
 SetZookeerperStateTarget(self) == /\ pc[self] = "SetZookeerperStateTarget"
+                                  /\ UpdateSourceOwnership
                                   /\ IF ~UpdateTargetOwnership
                                         THEN /\ UpdateTargetOwnership' = TRUE
                                              /\ \E sessions \in TargetSessions \ {self}:
@@ -769,6 +772,7 @@ SetZookeerperStateTarget(self) == /\ pc[self] = "SetZookeerperStateTarget"
                                   /\ pc' = [pc EXCEPT ![self] = "TakeOwnership"]
                                   /\ UNCHANGED << StateInit, ServerState, 
                                                   TransferComplete, 
+                                                  SourceAbort, TargetAbort, 
                                                   SViewNumber, TViewNumber, 
                                                   PrepForTransferRPC, 
                                                   UpdateSourceOwnership, 
@@ -782,21 +786,20 @@ SetZookeerperStateTarget(self) == /\ pc[self] = "SetZookeerperStateTarget"
                                                   Start2PC, SourcePrepare2PC, 
                                                   TargetPrepare2PC, 
                                                   Decision2PC, stack, Server, 
-                                                  KV, ViewNumber, OpCompleted, 
+                                                  KVRange, ViewNumber, OpComp, 
                                                   SKVRanges, SKVOwner, 
-                                                  SourceDecision, TKVRanges, 
-                                                  TKVOwner, TargetDecision, 
+                                                  TKVRanges, TKVOwner, 
                                                   KVRanges, CViewNumbers, 
-                                                  ServerNode, OpCompleted_, 
+                                                  ServerNode, OpCompleted, 
                                                   CurKV >>
 
 TakeOwnership(self) == /\ pc[self] = "TakeOwnership"
                        /\ TakeOwnershipRPC
                        /\ ServerState' = [ServerState EXCEPT ![self] = ReceivingData]
-                       /\ pc' = [pc EXCEPT ![self] = "Done"]
+                       /\ pc' = [pc EXCEPT ![self] = "WaitForDecisionTarget"]
                        /\ UNCHANGED << StateInit, TransferComplete, 
-                                       SViewNumber, TViewNumber, 
-                                       PrepForTransferRPC, 
+                                       SourceAbort, TargetAbort, SViewNumber, 
+                                       TViewNumber, PrepForTransferRPC, 
                                        UpdateSourceOwnership, 
                                        UpdateTargetOwnership, TakeOwnershipRPC, 
                                        TransferCompleteRPC, 
@@ -806,15 +809,46 @@ TakeOwnership(self) == /\ pc[self] = "TakeOwnership"
                                        MigrationViewNumbers, MigrationRange, 
                                        ServerVote, Start2PC, SourcePrepare2PC, 
                                        TargetPrepare2PC, Decision2PC, stack, 
-                                       Server, KV, ViewNumber, OpCompleted, 
-                                       SKVRanges, SKVOwner, SourceDecision, 
-                                       TKVRanges, TKVOwner, TargetDecision, 
-                                       KVRanges, CViewNumbers, ServerNode, 
-                                       OpCompleted_, CurKV >>
+                                       Server, KVRange, ViewNumber, OpComp, 
+                                       SKVRanges, SKVOwner, TKVRanges, 
+                                       TKVOwner, KVRanges, CViewNumbers, 
+                                       ServerNode, OpCompleted, CurKV >>
+
+WaitForDecisionTarget(self) == /\ pc[self] = "WaitForDecisionTarget"
+                               /\ TargetAbort \/ Decision2PC
+                               /\ IF TargetAbort
+                                     THEN /\ ServerState' = [ServerState EXCEPT ![self] = 2PCAbort]
+                                     ELSE /\ IF ServerVote[Source] /\ ServerVote[Target]
+                                                THEN /\ ServerState' = [ServerState EXCEPT ![self] = 2PCCommit]
+                                                ELSE /\ ServerState' = [ServerState EXCEPT ![self] = 2PCAbort]
+                               /\ pc' = [pc EXCEPT ![self] = "Done"]
+                               /\ UNCHANGED << StateInit, TransferComplete, 
+                                               SourceAbort, TargetAbort, 
+                                               SViewNumber, TViewNumber, 
+                                               PrepForTransferRPC, 
+                                               UpdateSourceOwnership, 
+                                               UpdateTargetOwnership, 
+                                               TakeOwnershipRPC, 
+                                               TransferCompleteRPC, 
+                                               ACKTransferCompleteRPC, 
+                                               SourceACK, TargetACK, 
+                                               AllServerRanges, 
+                                               AllServerViewNumbers, 
+                                               MigrationServers, 
+                                               MigrationViewNumbers, 
+                                               MigrationRange, ServerVote, 
+                                               Start2PC, SourcePrepare2PC, 
+                                               TargetPrepare2PC, Decision2PC, 
+                                               stack, Server, KVRange, 
+                                               ViewNumber, OpComp, SKVRanges, 
+                                               SKVOwner, TKVRanges, TKVOwner, 
+                                               KVRanges, CViewNumbers, 
+                                               ServerNode, OpCompleted, CurKV >>
 
 TargetProcess(self) == InitMigrationTarget(self)
                           \/ SetZookeerperStateTarget(self)
                           \/ TakeOwnership(self)
+                          \/ WaitForDecisionTarget(self)
 
 StartCheckpointing == /\ pc[Target] = "StartCheckpointing"
                       /\ TransferCompleteRPC
@@ -822,8 +856,9 @@ StartCheckpointing == /\ pc[Target] = "StartCheckpointing"
                            ServerState' = [ServerState EXCEPT ![s] = Checkpointing]
                       /\ ACKTransferCompleteRPC' = TRUE
                       /\ pc' = [pc EXCEPT ![Target] = "WaitFor2PC"]
-                      /\ UNCHANGED << StateInit, TransferComplete, SViewNumber, 
-                                      TViewNumber, PrepForTransferRPC, 
+                      /\ UNCHANGED << StateInit, TransferComplete, SourceAbort, 
+                                      TargetAbort, SViewNumber, TViewNumber, 
+                                      PrepForTransferRPC, 
                                       UpdateSourceOwnership, 
                                       UpdateTargetOwnership, TakeOwnershipRPC, 
                                       TransferCompleteRPC, SourceACK, 
@@ -832,25 +867,23 @@ StartCheckpointing == /\ pc[Target] = "StartCheckpointing"
                                       MigrationViewNumbers, MigrationRange, 
                                       ServerVote, Start2PC, SourcePrepare2PC, 
                                       TargetPrepare2PC, Decision2PC, stack, 
-                                      Server, KV, ViewNumber, OpCompleted, 
-                                      SKVRanges, SKVOwner, SourceDecision, 
-                                      TKVRanges, TKVOwner, TargetDecision, 
+                                      Server, KVRange, ViewNumber, OpComp, 
+                                      SKVRanges, SKVOwner, TKVRanges, TKVOwner, 
                                       KVRanges, CViewNumbers, ServerNode, 
-                                      OpCompleted_, CurKV >>
+                                      OpCompleted, CurKV >>
 
 WaitFor2PC == /\ pc[Target] = "WaitFor2PC"
               /\ TargetPrepare2PC
               /\ \/ /\ TargetACK' = TRUE
                     /\ \E s \in TargetSessions:
                          ServerState' = [ServerState EXCEPT ![s] = 2PCPrepare]
-                    /\ UNCHANGED TargetDecision
+                    /\ UNCHANGED TargetAbort
                  \/ /\ TargetACK' = FALSE
-                    /\ \E s \in TargetSessions:
-                         ServerState' = [ServerState EXCEPT ![s] = 2PCAbort]
-                    /\ TargetDecision' = TRUE
-              /\ pc' = [pc EXCEPT ![Target] = "WaitForDecisionTarget"]
-              /\ UNCHANGED << StateInit, TransferComplete, SViewNumber, 
-                              TViewNumber, PrepForTransferRPC, 
+                    /\ TargetAbort' = TRUE
+                    /\ UNCHANGED ServerState
+              /\ pc' = [pc EXCEPT ![Target] = "Done"]
+              /\ UNCHANGED << StateInit, TransferComplete, SourceAbort, 
+                              SViewNumber, TViewNumber, PrepForTransferRPC, 
                               UpdateSourceOwnership, UpdateTargetOwnership, 
                               TakeOwnershipRPC, TransferCompleteRPC, 
                               ACKTransferCompleteRPC, SourceACK, 
@@ -858,61 +891,31 @@ WaitFor2PC == /\ pc[Target] = "WaitFor2PC"
                               MigrationServers, MigrationViewNumbers, 
                               MigrationRange, ServerVote, Start2PC, 
                               SourcePrepare2PC, TargetPrepare2PC, Decision2PC, 
-                              stack, Server, KV, ViewNumber, OpCompleted, 
-                              SKVRanges, SKVOwner, SourceDecision, TKVRanges, 
-                              TKVOwner, KVRanges, CViewNumbers, ServerNode, 
-                              OpCompleted_, CurKV >>
+                              stack, Server, KVRange, ViewNumber, OpComp, 
+                              SKVRanges, SKVOwner, TKVRanges, TKVOwner, 
+                              KVRanges, CViewNumbers, ServerNode, OpCompleted, 
+                              CurKV >>
 
-WaitForDecisionTarget == /\ pc[Target] = "WaitForDecisionTarget"
-                         /\ IF ~TargetDecision
-                               THEN /\ Decision2PC
-                                    /\ IF ServerVote[Source]
-                                          THEN /\ \E s \in TargetSessions:
-                                                    ServerState' = [ServerState EXCEPT ![s] = 2PCCommit]
-                                          ELSE /\ \E s \in TargetSessions:
-                                                    ServerState' = [ServerState EXCEPT ![s] = 2PCAbort]
-                               ELSE /\ TRUE
-                                    /\ UNCHANGED ServerState
-                         /\ pc' = [pc EXCEPT ![Target] = "Done"]
-                         /\ UNCHANGED << StateInit, TransferComplete, 
-                                         SViewNumber, TViewNumber, 
-                                         PrepForTransferRPC, 
-                                         UpdateSourceOwnership, 
-                                         UpdateTargetOwnership, 
-                                         TakeOwnershipRPC, TransferCompleteRPC, 
-                                         ACKTransferCompleteRPC, SourceACK, 
-                                         TargetACK, AllServerRanges, 
-                                         AllServerViewNumbers, 
-                                         MigrationServers, 
-                                         MigrationViewNumbers, MigrationRange, 
-                                         ServerVote, Start2PC, 
-                                         SourcePrepare2PC, TargetPrepare2PC, 
-                                         Decision2PC, stack, Server, KV, 
-                                         ViewNumber, OpCompleted, SKVRanges, 
-                                         SKVOwner, SourceDecision, TKVRanges, 
-                                         TKVOwner, TargetDecision, KVRanges, 
-                                         CViewNumbers, ServerNode, 
-                                         OpCompleted_, CurKV >>
-
-TargetServer == StartCheckpointing \/ WaitFor2PC \/ WaitForDecisionTarget
+TargetServer == StartCheckpointing \/ WaitFor2PC
 
 InitState == /\ pc[Zookeeper] = "InitState"
              /\ AllServerRanges' = [AllServerRanges EXCEPT ![Source] = {SourceKeys, KeysToMigrate},
                                                            ![Target] = {TargetKeys}]
              /\ StateInit' = TRUE
              /\ pc' = [pc EXCEPT ![Zookeeper] = "SetMigrationSourceState"]
-             /\ UNCHANGED << ServerState, TransferComplete, SViewNumber, 
-                             TViewNumber, PrepForTransferRPC, 
-                             UpdateSourceOwnership, UpdateTargetOwnership, 
-                             TakeOwnershipRPC, TransferCompleteRPC, 
-                             ACKTransferCompleteRPC, SourceACK, TargetACK, 
-                             AllServerViewNumbers, MigrationServers, 
-                             MigrationViewNumbers, MigrationRange, ServerVote, 
-                             Start2PC, SourcePrepare2PC, TargetPrepare2PC, 
-                             Decision2PC, stack, Server, KV, ViewNumber, 
-                             OpCompleted, SKVRanges, SKVOwner, SourceDecision, 
-                             TKVRanges, TKVOwner, TargetDecision, KVRanges, 
-                             CViewNumbers, ServerNode, OpCompleted_, CurKV >>
+             /\ UNCHANGED << ServerState, TransferComplete, SourceAbort, 
+                             TargetAbort, SViewNumber, TViewNumber, 
+                             PrepForTransferRPC, UpdateSourceOwnership, 
+                             UpdateTargetOwnership, TakeOwnershipRPC, 
+                             TransferCompleteRPC, ACKTransferCompleteRPC, 
+                             SourceACK, TargetACK, AllServerViewNumbers, 
+                             MigrationServers, MigrationViewNumbers, 
+                             MigrationRange, ServerVote, Start2PC, 
+                             SourcePrepare2PC, TargetPrepare2PC, Decision2PC, 
+                             stack, Server, KVRange, ViewNumber, OpComp, 
+                             SKVRanges, SKVOwner, TKVRanges, TKVOwner, 
+                             KVRanges, CViewNumbers, ServerNode, OpCompleted, 
+                             CurKV >>
 
 SetMigrationSourceState == /\ pc[Zookeeper] = "SetMigrationSourceState"
                            /\ UpdateSourceOwnership
@@ -920,7 +923,8 @@ SetMigrationSourceState == /\ pc[Zookeeper] = "SetMigrationSourceState"
                            /\ AllServerViewNumbers' = [AllServerViewNumbers EXCEPT ![Head(MigrationServers)] = Head(MigrationViewNumbers)]
                            /\ pc' = [pc EXCEPT ![Zookeeper] = "SetMigrationTargetState"]
                            /\ UNCHANGED << StateInit, ServerState, 
-                                           TransferComplete, SViewNumber, 
+                                           TransferComplete, SourceAbort, 
+                                           TargetAbort, SViewNumber, 
                                            TViewNumber, PrepForTransferRPC, 
                                            UpdateSourceOwnership, 
                                            UpdateTargetOwnership, 
@@ -932,12 +936,11 @@ SetMigrationSourceState == /\ pc[Zookeeper] = "SetMigrationSourceState"
                                            MigrationRange, ServerVote, 
                                            Start2PC, SourcePrepare2PC, 
                                            TargetPrepare2PC, Decision2PC, 
-                                           stack, Server, KV, ViewNumber, 
-                                           OpCompleted, SKVRanges, SKVOwner, 
-                                           SourceDecision, TKVRanges, TKVOwner, 
-                                           TargetDecision, KVRanges, 
+                                           stack, Server, KVRange, ViewNumber, 
+                                           OpComp, SKVRanges, SKVOwner, 
+                                           TKVRanges, TKVOwner, KVRanges, 
                                            CViewNumbers, ServerNode, 
-                                           OpCompleted_, CurKV >>
+                                           OpCompleted, CurKV >>
 
 SetMigrationTargetState == /\ pc[Zookeeper] = "SetMigrationTargetState"
                            /\ UpdateTargetOwnership
@@ -945,7 +948,8 @@ SetMigrationTargetState == /\ pc[Zookeeper] = "SetMigrationTargetState"
                            /\ AllServerViewNumbers' = [AllServerViewNumbers EXCEPT ![Head(Tail(MigrationServers))] = Head(Tail(MigrationViewNumbers))]
                            /\ pc' = [pc EXCEPT ![Zookeeper] = "Init2PC"]
                            /\ UNCHANGED << StateInit, ServerState, 
-                                           TransferComplete, SViewNumber, 
+                                           TransferComplete, SourceAbort, 
+                                           TargetAbort, SViewNumber, 
                                            TViewNumber, PrepForTransferRPC, 
                                            UpdateSourceOwnership, 
                                            UpdateTargetOwnership, 
@@ -957,12 +961,11 @@ SetMigrationTargetState == /\ pc[Zookeeper] = "SetMigrationTargetState"
                                            MigrationRange, ServerVote, 
                                            Start2PC, SourcePrepare2PC, 
                                            TargetPrepare2PC, Decision2PC, 
-                                           stack, Server, KV, ViewNumber, 
-                                           OpCompleted, SKVRanges, SKVOwner, 
-                                           SourceDecision, TKVRanges, TKVOwner, 
-                                           TargetDecision, KVRanges, 
+                                           stack, Server, KVRange, ViewNumber, 
+                                           OpComp, SKVRanges, SKVOwner, 
+                                           TKVRanges, TKVOwner, KVRanges, 
                                            CViewNumbers, ServerNode, 
-                                           OpCompleted_, CurKV >>
+                                           OpCompleted, CurKV >>
 
 Init2PC == /\ pc[Zookeeper] = "Init2PC"
            /\ Start2PC
@@ -970,17 +973,17 @@ Init2PC == /\ pc[Zookeeper] = "Init2PC"
            /\ TargetPrepare2PC' = TRUE
            /\ pc' = [pc EXCEPT ![Zookeeper] = "CompletionDecision"]
            /\ UNCHANGED << StateInit, ServerState, TransferComplete, 
-                           SViewNumber, TViewNumber, PrepForTransferRPC, 
-                           UpdateSourceOwnership, UpdateTargetOwnership, 
-                           TakeOwnershipRPC, TransferCompleteRPC, 
-                           ACKTransferCompleteRPC, SourceACK, TargetACK, 
-                           AllServerRanges, AllServerViewNumbers, 
-                           MigrationServers, MigrationViewNumbers, 
-                           MigrationRange, ServerVote, Start2PC, Decision2PC, 
-                           stack, Server, KV, ViewNumber, OpCompleted, 
-                           SKVRanges, SKVOwner, SourceDecision, TKVRanges, 
-                           TKVOwner, TargetDecision, KVRanges, CViewNumbers, 
-                           ServerNode, OpCompleted_, CurKV >>
+                           SourceAbort, TargetAbort, SViewNumber, TViewNumber, 
+                           PrepForTransferRPC, UpdateSourceOwnership, 
+                           UpdateTargetOwnership, TakeOwnershipRPC, 
+                           TransferCompleteRPC, ACKTransferCompleteRPC, 
+                           SourceACK, TargetACK, AllServerRanges, 
+                           AllServerViewNumbers, MigrationServers, 
+                           MigrationViewNumbers, MigrationRange, ServerVote, 
+                           Start2PC, Decision2PC, stack, Server, KVRange, 
+                           ViewNumber, OpComp, SKVRanges, SKVOwner, TKVRanges, 
+                           TKVOwner, KVRanges, CViewNumbers, ServerNode, 
+                           OpCompleted, CurKV >>
 
 CompletionDecision == /\ pc[Zookeeper] = "CompletionDecision"
                       /\ SourceACK \in BOOLEAN \/ TargetACK \in BOOLEAN
@@ -1007,8 +1010,8 @@ CompletionDecision == /\ pc[Zookeeper] = "CompletionDecision"
                                                              /\ UNCHANGED ServerVote
                       /\ pc' = [pc EXCEPT ![Zookeeper] = "CommitMigration"]
                       /\ UNCHANGED << StateInit, ServerState, TransferComplete, 
-                                      SViewNumber, TViewNumber, 
-                                      PrepForTransferRPC, 
+                                      SourceAbort, TargetAbort, SViewNumber, 
+                                      TViewNumber, PrepForTransferRPC, 
                                       UpdateSourceOwnership, 
                                       UpdateTargetOwnership, TakeOwnershipRPC, 
                                       TransferCompleteRPC, 
@@ -1018,11 +1021,10 @@ CompletionDecision == /\ pc[Zookeeper] = "CompletionDecision"
                                       MigrationViewNumbers, MigrationRange, 
                                       Start2PC, SourcePrepare2PC, 
                                       TargetPrepare2PC, Decision2PC, stack, 
-                                      Server, KV, ViewNumber, OpCompleted, 
-                                      SKVRanges, SKVOwner, SourceDecision, 
-                                      TKVRanges, TKVOwner, TargetDecision, 
+                                      Server, KVRange, ViewNumber, OpComp, 
+                                      SKVRanges, SKVOwner, TKVRanges, TKVOwner, 
                                       KVRanges, CViewNumbers, ServerNode, 
-                                      OpCompleted_, CurKV >>
+                                      OpCompleted, CurKV >>
 
 CommitMigration == /\ pc[Zookeeper] = "CommitMigration"
                    /\ Decision2PC' = TRUE
@@ -1037,19 +1039,18 @@ CommitMigration == /\ pc[Zookeeper] = "CommitMigration"
                                                 AllServerViewNumbers >>
                    /\ pc' = [pc EXCEPT ![Zookeeper] = "Done"]
                    /\ UNCHANGED << StateInit, ServerState, TransferComplete, 
-                                   SViewNumber, TViewNumber, 
-                                   PrepForTransferRPC, UpdateSourceOwnership, 
+                                   SourceAbort, TargetAbort, SViewNumber, 
+                                   TViewNumber, PrepForTransferRPC, 
+                                   UpdateSourceOwnership, 
                                    UpdateTargetOwnership, TakeOwnershipRPC, 
                                    TransferCompleteRPC, ACKTransferCompleteRPC, 
                                    SourceACK, TargetACK, MigrationServers, 
                                    MigrationViewNumbers, MigrationRange, 
                                    ServerVote, Start2PC, SourcePrepare2PC, 
-                                   TargetPrepare2PC, stack, Server, KV, 
-                                   ViewNumber, OpCompleted, SKVRanges, 
-                                   SKVOwner, SourceDecision, TKVRanges, 
-                                   TKVOwner, TargetDecision, KVRanges, 
-                                   CViewNumbers, ServerNode, OpCompleted_, 
-                                   CurKV >>
+                                   TargetPrepare2PC, stack, Server, KVRange, 
+                                   ViewNumber, OpComp, SKVRanges, SKVOwner, 
+                                   TKVRanges, TKVOwner, KVRanges, CViewNumbers, 
+                                   ServerNode, OpCompleted, CurKV >>
 
 CoordinatorProcess == InitState \/ SetMigrationSourceState
                          \/ SetMigrationTargetState \/ Init2PC
@@ -1059,7 +1060,8 @@ InitClient == /\ pc["Client"] = "InitClient"
               /\ StateInit
               /\ pc' = [pc EXCEPT !["Client"] = "ServerInteraction"]
               /\ UNCHANGED << StateInit, ServerState, TransferComplete, 
-                              SViewNumber, TViewNumber, PrepForTransferRPC, 
+                              SourceAbort, TargetAbort, SViewNumber, 
+                              TViewNumber, PrepForTransferRPC, 
                               UpdateSourceOwnership, UpdateTargetOwnership, 
                               TakeOwnershipRPC, TransferCompleteRPC, 
                               ACKTransferCompleteRPC, SourceACK, TargetACK, 
@@ -1067,18 +1069,19 @@ InitClient == /\ pc["Client"] = "InitClient"
                               MigrationServers, MigrationViewNumbers, 
                               MigrationRange, ServerVote, Start2PC, 
                               SourcePrepare2PC, TargetPrepare2PC, Decision2PC, 
-                              stack, Server, KV, ViewNumber, OpCompleted, 
-                              SKVRanges, SKVOwner, SourceDecision, TKVRanges, 
-                              TKVOwner, TargetDecision, KVRanges, CViewNumbers, 
-                              ServerNode, OpCompleted_, CurKV >>
+                              stack, Server, KVRange, ViewNumber, OpComp, 
+                              SKVRanges, SKVOwner, TKVRanges, TKVOwner, 
+                              KVRanges, CViewNumbers, ServerNode, OpCompleted, 
+                              CurKV >>
 
 ServerInteraction == /\ pc["Client"] = "ServerInteraction"
                      /\ IF ~Decision2PC
                            THEN /\ pc' = [pc EXCEPT !["Client"] = "RequestOp"]
                            ELSE /\ pc' = [pc EXCEPT !["Client"] = "Done"]
                      /\ UNCHANGED << StateInit, ServerState, TransferComplete, 
-                                     SViewNumber, TViewNumber, 
-                                     PrepForTransferRPC, UpdateSourceOwnership, 
+                                     SourceAbort, TargetAbort, SViewNumber, 
+                                     TViewNumber, PrepForTransferRPC, 
+                                     UpdateSourceOwnership, 
                                      UpdateTargetOwnership, TakeOwnershipRPC, 
                                      TransferCompleteRPC, 
                                      ACKTransferCompleteRPC, SourceACK, 
@@ -1087,29 +1090,29 @@ ServerInteraction == /\ pc["Client"] = "ServerInteraction"
                                      MigrationViewNumbers, MigrationRange, 
                                      ServerVote, Start2PC, SourcePrepare2PC, 
                                      TargetPrepare2PC, Decision2PC, stack, 
-                                     Server, KV, ViewNumber, OpCompleted, 
-                                     SKVRanges, SKVOwner, SourceDecision, 
-                                     TKVRanges, TKVOwner, TargetDecision, 
+                                     Server, KVRange, ViewNumber, OpComp, 
+                                     SKVRanges, SKVOwner, TKVRanges, TKVOwner, 
                                      KVRanges, CViewNumbers, ServerNode, 
-                                     OpCompleted_, CurKV >>
+                                     OpCompleted, CurKV >>
 
 RequestOp == /\ pc["Client"] = "RequestOp"
              /\ \E kv \in KVRanges:
                   /\ CurKV' = kv
-                  /\ /\ KV' = [KV EXCEPT !["Client"] = kv]
-                     /\ OpCompleted' = [OpCompleted EXCEPT !["Client"] = OpCompleted_]
+                  /\ /\ KVRange' = [KVRange EXCEPT !["Client"] = kv]
+                     /\ OpComp' = [OpComp EXCEPT !["Client"] = OpCompleted]
                      /\ Server' = [Server EXCEPT !["Client"] = ServerNode[kv]]
                      /\ ViewNumber' = [ViewNumber EXCEPT !["Client"] = CViewNumbers[kv]]
                      /\ stack' = [stack EXCEPT !["Client"] = << [ procedure |->  "MakeRequest",
                                                                   pc        |->  "UpdateClientState",
                                                                   Server    |->  Server["Client"],
-                                                                  KV        |->  KV["Client"],
+                                                                  KVRange   |->  KVRange["Client"],
                                                                   ViewNumber |->  ViewNumber["Client"],
-                                                                  OpCompleted |->  OpCompleted["Client"] ] >>
+                                                                  OpComp    |->  OpComp["Client"] ] >>
                                                               \o stack["Client"]]
                   /\ pc' = [pc EXCEPT !["Client"] = "CheckServerRange"]
              /\ UNCHANGED << StateInit, ServerState, TransferComplete, 
-                             SViewNumber, TViewNumber, PrepForTransferRPC, 
+                             SourceAbort, TargetAbort, SViewNumber, 
+                             TViewNumber, PrepForTransferRPC, 
                              UpdateSourceOwnership, UpdateTargetOwnership, 
                              TakeOwnershipRPC, TransferCompleteRPC, 
                              ACKTransferCompleteRPC, SourceACK, TargetACK, 
@@ -1117,23 +1120,27 @@ RequestOp == /\ pc["Client"] = "RequestOp"
                              MigrationServers, MigrationViewNumbers, 
                              MigrationRange, ServerVote, Start2PC, 
                              SourcePrepare2PC, TargetPrepare2PC, Decision2PC, 
-                             SKVRanges, SKVOwner, SourceDecision, TKVRanges, 
-                             TKVOwner, TargetDecision, KVRanges, CViewNumbers, 
-                             ServerNode, OpCompleted_ >>
+                             SKVRanges, SKVOwner, TKVRanges, TKVOwner, 
+                             KVRanges, CViewNumbers, ServerNode, OpCompleted >>
 
 UpdateClientState == /\ pc["Client"] = "UpdateClientState"
-                     /\ IF ~OpCompleted_
+                     /\ IF ~OpCompleted
                            THEN /\ IF CurKV \in AllServerRanges[Source]
                                       THEN /\ ServerNode' = [ServerNode EXCEPT ![CurKV] = Source]
                                            /\ CViewNumbers' = [CViewNumbers EXCEPT ![CurKV] = AllServerViewNumbers[Source]]
-                                      ELSE /\ ServerNode' = [ServerNode EXCEPT ![CurKV] = Target]
-                                           /\ CViewNumbers' = [CViewNumbers EXCEPT ![CurKV] = AllServerViewNumbers[Target]]
+                                      ELSE /\ IF CurKV \in AllServerRanges[Target]
+                                                 THEN /\ ServerNode' = [ServerNode EXCEPT ![CurKV] = Target]
+                                                      /\ CViewNumbers' = [CViewNumbers EXCEPT ![CurKV] = AllServerViewNumbers[Target]]
+                                                 ELSE /\ TRUE
+                                                      /\ UNCHANGED << CViewNumbers, 
+                                                                      ServerNode >>
                            ELSE /\ TRUE
                                 /\ UNCHANGED << CViewNumbers, ServerNode >>
                      /\ pc' = [pc EXCEPT !["Client"] = "ServerInteraction"]
                      /\ UNCHANGED << StateInit, ServerState, TransferComplete, 
-                                     SViewNumber, TViewNumber, 
-                                     PrepForTransferRPC, UpdateSourceOwnership, 
+                                     SourceAbort, TargetAbort, SViewNumber, 
+                                     TViewNumber, PrepForTransferRPC, 
+                                     UpdateSourceOwnership, 
                                      UpdateTargetOwnership, TakeOwnershipRPC, 
                                      TransferCompleteRPC, 
                                      ACKTransferCompleteRPC, SourceACK, 
@@ -1142,10 +1149,9 @@ UpdateClientState == /\ pc["Client"] = "UpdateClientState"
                                      MigrationViewNumbers, MigrationRange, 
                                      ServerVote, Start2PC, SourcePrepare2PC, 
                                      TargetPrepare2PC, Decision2PC, stack, 
-                                     Server, KV, ViewNumber, OpCompleted, 
-                                     SKVRanges, SKVOwner, SourceDecision, 
-                                     TKVRanges, TKVOwner, TargetDecision, 
-                                     KVRanges, OpCompleted_, CurKV >>
+                                     Server, KVRange, ViewNumber, OpComp, 
+                                     SKVRanges, SKVOwner, TKVRanges, TKVOwner, 
+                                     KVRanges, OpCompleted, CurKV >>
 
 Clients == InitClient \/ ServerInteraction \/ RequestOp
               \/ UpdateClientState
@@ -1170,5 +1176,5 @@ Termination == <>(\A self \in ProcSet: pc[self] = "Done")
 \* END TRANSLATION
 =============================================================================
 \* Modification History
-\* Last modified Thu Feb 21 18:39:17 MST 2019 by aarushi
+\* Last modified Tue Feb 26 20:00:51 MST 2019 by aarushi
 \* Created Thu Jan 17 10:53:34 MST 2019 by aarushi
